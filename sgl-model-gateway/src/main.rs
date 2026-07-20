@@ -760,6 +760,8 @@ impl CliArgs {
         match policy_str {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
+            "pic_round_robin" => PolicyConfig::PicRoundRobin,
+            "pic_lpt" => PolicyConfig::PicLpt,
             "cache_aware" => PolicyConfig::CacheAware {
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,

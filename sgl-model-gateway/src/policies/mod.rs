@@ -15,6 +15,7 @@ mod cache_aware;
 mod consistent_hashing;
 mod factory;
 mod manual;
+pub mod pic;
 mod power_of_two;
 mod prefix_hash;
 mod random;

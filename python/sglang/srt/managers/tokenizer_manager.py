@@ -80,6 +80,7 @@ from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.pic.segmenter import split_and_tokenize
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
@@ -259,6 +260,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
         set_global_server_args_for_tokenizer(server_args)
+
+        # PIC scatter: text_hashes of segments this worker has scatter-warmed.
+        # The router pulls this via GET /pic_scatter/cached_segments to build its
+        # segment-cache directory.
+        # ponytail: best-effort set; stale-positive entries only cost a recompute,
+        # and the 60s rebuild reflects current reports. Accept unbounded-ish growth
+        # for v1 (bounded by distinct segments).
+        self._pic_cached_text_hashes = set()
 
         # Init model config
         self.init_model_config()
@@ -815,6 +824,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if not input_text and self.mm_processor and obj.contains_mm_input():
                 # Use empty placeholder - multimodal processor will override
                 input_ids = []
+            elif (
+                (self.server_args.pic_enable
+                 or __import__("os").environ.get("PIC_DIAG_FORCE_SPLIT") == "1")
+                and input_text is not None
+                and obj.input_ids is None
+            ):
+                # PIC: split prompt on the configured separator and tokenize
+                # per segment so PIC_SEPARATOR_STR never enters input_ids.
+                # PIC_DIAG_FORCE_SPLIT=1 activates this path even without
+                # pic_enable, so baseline runs see identical token ids.
+                # v1 only supports single-string text; batched PIC input is
+                # rejected here and should be handled before this point.
+                if isinstance(input_text, list):
+                    raise NotImplementedError(
+                        "PIC v1 does not support batched text input. "
+                        "Submit single-prompt requests when pic_enable=True."
+                    )
+                input_ids, pic_segments = split_and_tokenize(
+                    input_text,
+                    self.tokenizer,
+                    separator=self.server_args.pic_separator_str,
+                )
+                obj.input_ids = input_ids
+                obj.pic_segments = pic_segments
+                if __import__("os").environ.get("PIC_DIAG_FORCE_SPLIT") == "1":
+                    import sys
+                    print(f"[DIAG_FORCE_SPLIT] input_len={len(input_ids)} "
+                          f"n_segs={len(pic_segments)} "
+                          f"first8={input_ids[:8]}", flush=True, file=sys.stderr)
             else:
                 input_ids, token_type_ids = await self._tokenize_texts(
                     input_text, is_cross_encoder_request
@@ -1172,7 +1210,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 mm_data_mooncake=obj.mm_data_mooncake,
                 encoder_urls=obj.encoder_urls,
+                pic_segments=getattr(obj, "pic_segments", None),
+                pic_scatter_single_seg=getattr(obj, "pic_scatter_single_seg", False),
+                pic_scatter_meta=getattr(obj, "pic_scatter_meta", None),
+                pic_combine=getattr(obj, "pic_combine", None),
             )
+            # PIC scatter: this worker now holds the segment — record its
+            # text_hash so the router's directory can route future hits here.
+            if getattr(obj, "pic_scatter_single_seg", False) and obj.text:
+                from sglang.srt.pic.scatter_xfer import text_hash
+
+                self._pic_cached_text_hashes.add(text_hash(obj.text))
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
             positional_embed_overrides = obj.positional_embed_overrides

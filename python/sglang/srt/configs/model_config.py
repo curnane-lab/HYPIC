@@ -636,6 +636,12 @@ class ModelConfig:
                 )
 
         self.has_attention_sinks = self._detect_attention_sinks()
+        # Bailing hybrid-linear models loaded via trust_remote_code expose a
+        # BailingMoeLinearV2Config that lacks the layer-id / mamba-params helpers
+        # provided by our in-tree BailingHybridConfig. Attach them here so the
+        # rest of the runtime (mambaish_config consumers) can treat both the
+        # same.
+        self._maybe_patch_bailing_linear_hybrid_config()
 
         self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
             *MIMO_V2_MODEL_ARCHS,
@@ -663,6 +669,99 @@ class ModelConfig:
                 self.hf_text_config, "add_swa_attention_sink_bias", False
             ) or getattr(self.hf_text_config, "add_full_attention_sink_bias", False)
         return False
+    def _maybe_patch_bailing_linear_hybrid_config(self):
+        hf = self.hf_config
+        text = self.hf_text_config
+        model_type = getattr(hf, "model_type", None)
+        architectures = getattr(hf, "architectures", None) or []
+        is_bailing_linear = model_type == "bailing_moe_linear" or any(
+            a in ("BailingMoeLinearV2ForCausalLM", "BailingMoELinearForCausalLM")
+            for a in architectures
+        )
+        if not is_bailing_linear:
+            return
+
+        num_hidden_layers = getattr(
+            text, "num_hidden_layers", getattr(hf, "num_hidden_layers", 0)
+        )
+        group = getattr(text, "layer_group_size", getattr(hf, "layer_group_size", 1)) or 1
+        full_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if (i + 1) % group == 0
+        ]
+        linear_layer_ids = [
+            i for i in range(num_hidden_layers) if i not in full_attention_layer_ids
+        ]
+
+        # Attach layer-id lists directly; the mixin reads
+        # `mambaish.full_attention_layer_ids` as a plain attribute.
+        if not hasattr(hf, "full_attention_layer_ids"):
+            try:
+                hf.full_attention_layer_ids = full_attention_layer_ids
+            except Exception:
+                object.__setattr__(hf, "full_attention_layer_ids", full_attention_layer_ids)
+        if not hasattr(hf, "linear_layer_ids"):
+            try:
+                hf.linear_layer_ids = linear_layer_ids
+            except Exception:
+                object.__setattr__(hf, "linear_layer_ids", linear_layer_ids)
+
+        # Mamba2-style cache params used by the KV-cache mixin to size the
+        # linear-state pool. SegLA stores a (num_kv_heads, head_dim, head_dim)
+        # recurrent state per linear layer; mirror BailingHybridConfig.
+        # Construction requires the attention TP group, which isn't initialized
+        # at ModelConfig time. Try once now; if TP is not ready (the common
+        # path), skip — ensure_bailing_linear_mamba_params() will retry once
+        # init_memory_pool runs and the TP group is live.
+        if not hasattr(hf, "mamba2_cache_params"):
+            try:
+                self._build_bailing_linear_mamba_cache_params()
+            except Exception:
+                pass
+
+    def _build_bailing_linear_mamba_cache_params(self):
+        """Construct mamba2_cache_params for bailing_moe_linear configs.
+
+        Requires the attention TP group to be initialized.
+        """
+        hf = self.hf_config
+        text = self.hf_text_config
+        if hasattr(hf, "mamba2_cache_params"):
+            return
+        linear_layer_ids = getattr(hf, "linear_layer_ids", None)
+        if linear_layer_ids is None:
+            return
+
+        from sglang.srt.configs.mamba_utils import (
+            Mamba2CacheParams,
+            Mamba2StateShape,
+        )
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+        num_linear_kv_heads = getattr(
+            text,
+            "num_linear_key_value_heads",
+            getattr(text, "num_attention_heads", 1),
+        )
+        head_dim = getattr(
+            text,
+            "head_dim",
+            getattr(text, "hidden_size", 0)
+            // max(getattr(text, "num_attention_heads", 1), 1),
+        )
+        shape = Mamba2StateShape.create(
+            tp_world_size=get_attention_tp_size(),
+            intermediate_size=0,
+            n_groups=0,
+            num_heads=num_linear_kv_heads,
+            head_dim=head_dim,
+            state_size=head_dim,
+            conv_kernel=1,
+        )
+        params = Mamba2CacheParams(shape=shape, layers=linear_layer_ids)
+        try:
+            hf.mamba2_cache_params = params
+        except Exception:
+            object.__setattr__(hf, "mamba2_cache_params", params)
 
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model
@@ -1955,6 +2054,20 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
         ]
+    elif (
+        "BailingMoeLinearV2ForCausalLM" in model_architectures
+        or "BailingMoELinearForCausalLM" in model_architectures
+    ):
+        # Ring-mini-linear-2.0: full-attn at (i+1) % layer_group_size == 0,
+        # everything else is linear-attn (SegLA / lightning).
+        group = getattr(hf_text_config, "layer_group_size", 1)
+        if group and group > 0:
+            full_attention_layer_ids = [
+                i for i in range(num_hidden_layers) if (i + 1) % group == 0
+            ]
+        else:
+            full_attention_layer_ids = list(range(num_hidden_layers))
+        swa_attention_layer_ids = None
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

@@ -32,6 +32,8 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "manual": PolicyType.Manual,
         "consistent_hashing": PolicyType.ConsistentHashing,
         "prefix_hash": PolicyType.PrefixHash,
+        "pic_round_robin": PolicyType.PicRoundRobin,
+        "pic_lpt": PolicyType.PicLpt,
     }
     return policy_map[policy_str]
 

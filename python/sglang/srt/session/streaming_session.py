@@ -60,6 +60,7 @@ class SessionSlot:
     mamba_ping_pong_track_buffer: Any = None
     mamba_next_track_idx: Any = None
     mamba_last_track_seqlen: Any = None
+    mamba_last_track_buffer_idx: Any = None
     mamba_branching_seqlen: Any = None
 
     @property
@@ -83,6 +84,7 @@ class SessionSlot:
         self.mamba_ping_pong_track_buffer = req.mamba_ping_pong_track_buffer
         self.mamba_next_track_idx = req.mamba_next_track_idx
         self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
+        self.mamba_last_track_buffer_idx = req.mamba_last_track_buffer_idx
         self.mamba_branching_seqlen = req.mamba_branching_seqlen
 
         # Ownership has transferred to the slot. Null *all* of the req's
@@ -98,6 +100,7 @@ class SessionSlot:
         req.mamba_ping_pong_track_buffer = None
         req.mamba_next_track_idx = None
         req.mamba_last_track_seqlen = None
+        req.mamba_last_track_buffer_idx = None
         req.mamba_branching_seqlen = None
 
     def restore_to_req(self, req: Req):
@@ -112,6 +115,7 @@ class SessionSlot:
         req.mamba_ping_pong_track_buffer = self.mamba_ping_pong_track_buffer
         req.mamba_next_track_idx = self.mamba_next_track_idx
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
+        req.mamba_last_track_buffer_idx = self.mamba_last_track_buffer_idx
         req.mamba_branching_seqlen = self.mamba_branching_seqlen
 
         # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared

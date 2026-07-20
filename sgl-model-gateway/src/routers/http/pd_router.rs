@@ -54,6 +54,27 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    /// `Some(sep)` when the router runs the `pic_round_robin` policy; enables the
+    /// PIC scatter pre-step. `None` -> normal PD path, zero scatter branching.
+    pub pic_separator: Option<String>,
+    /// `true` when policy is `pic_lpt` — scatter uses LPT miss-balancing instead
+    /// of round-robin. `false` for `pic_round_robin` / non-PIC.
+    pub pic_lpt: bool,
+    /// Best-effort cross-request routing state: segment directory
+    /// (text_hash -> holding worker_url), global RR cursor, and per-worker LPT
+    /// byte-loads. `dir` is rebuilt every 5s by pulling each prefill worker's
+    /// held segments (plus optimistic insert on miss-assignment); `loads` decay
+    /// by half each tick.
+    pub pic_route_state: Arc<std::sync::Mutex<crate::policies::pic::PicRouteState>>,
+    /// Per-combine-worker admission semaphores (url -> semaphore). Caps the
+    /// number of concurrent scatter requests for which a worker is the combine
+    /// role, so a high-QPS burst cannot over-commit that worker's mamba pool.
+    /// Lazily populated in `combine_permit_sem`; entries are never removed
+    /// (bounded by worker count).
+    pub pic_combine_sems:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>>,
+    /// Combine-admission cap per worker. Env `PIC_MAX_COMBINE_INFLIGHT` (default 8).
+    pub pic_max_combine_inflight: usize,
 }
 
 #[derive(Clone)]
@@ -169,6 +190,33 @@ impl PDRouter {
     }
 
     pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+        let pic_lpt = matches!(
+            ctx.router_config.policy,
+            crate::config::PolicyConfig::PicLpt
+        );
+        let pic_separator = matches!(
+            ctx.router_config.policy,
+            crate::config::PolicyConfig::PicRoundRobin | crate::config::PolicyConfig::PicLpt
+        )
+        .then(|| crate::policies::pic::DEFAULT_PIC_SEPARATOR.to_string());
+        let pic_route_state = Arc::new(std::sync::Mutex::new(
+            crate::policies::pic::PicRouteState::new(),
+        ));
+        // ponytail: 5s best-effort rebuild — only run it when PIC scatter is on.
+        if pic_separator.is_some() {
+            Self::spawn_seg_cache_rebuild(
+                Arc::clone(&ctx.worker_registry),
+                ctx.client.clone(),
+                Arc::clone(&pic_route_state),
+            );
+        }
+        // ponytail: PIC combine-admission cap. Env-only (no CLI knob), matching
+        // the existing PIC "configured by policy/constants" pattern. >0 enforced.
+        let pic_max_combine_inflight = std::env::var("PIC_MAX_COMBINE_INFLIGHT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(8);
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
@@ -176,7 +224,78 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            // ponytail: PIC mode is detected purely from the main policy. The
+            // segment separator is the constant DEFAULT_PIC_SEPARATOR (no CLI
+            // knob — engine and router agree on the default).
+            pic_separator,
+            pic_lpt,
+            pic_route_state,
+            pic_combine_sems: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pic_max_combine_inflight,
         })
+    }
+
+    /// Spawn the 5s background task that rebuilds the segment-cache directory.
+    ///
+    /// Each tick: GET `{worker}/pic_scatter/cached_segments` from every prefill
+    /// worker, build a fresh `text_hash -> worker_url` map, swap it in under the
+    /// lock and halve the LPT loads. ponytail: 5s best-effort cadence; a fresh
+    /// map each time so stale holders age out within one interval.
+    fn spawn_seg_cache_rebuild(
+        worker_registry: Arc<WorkerRegistry>,
+        client: Client,
+        route_state: Arc<std::sync::Mutex<crate::policies::pic::PicRouteState>>,
+    ) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let workers = worker_registry.get_prefill_workers();
+                let mut fresh = crate::policies::pic::SegCache::new();
+                for worker in &workers {
+                    let url = worker.url().to_string();
+                    let endpoint = format!("{}/pic_scatter/cached_segments", url);
+                    match client.get(&endpoint).send().await {
+                        Ok(res) if res.status().is_success() => {
+                            match res.json::<Value>().await {
+                                Ok(v) => {
+                                    if let Some(hashes) =
+                                        v.get("text_hashes").and_then(|h| h.as_array())
+                                    {
+                                        for h in hashes {
+                                            if let Some(h) = h.as_u64() {
+                                                fresh.insert(h, url.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => warn!(
+                                    "PIC seg-cache: bad JSON from {}: {}",
+                                    endpoint, e
+                                ),
+                            }
+                        }
+                        Ok(res) => debug!(
+                            "PIC seg-cache: {} returned {}",
+                            endpoint,
+                            res.status()
+                        ),
+                        Err(e) => {
+                            debug!("PIC seg-cache: GET {} failed: {}", endpoint, e)
+                        }
+                    }
+                }
+                if let Ok(mut guard) = route_state.lock() {
+                    guard.dir = fresh;
+                    // LPT 负载减半衰减(halflife 5s):有界防增长,空闲 worker 几 tick 内恢复。
+                    for v in guard.loads.values_mut() {
+                        *v /= 2;
+                    }
+                }
+            }
+        });
     }
 
     fn handle_server_selection_error(error: String) -> Response {
@@ -1293,6 +1412,197 @@ impl PDRouter {
         );
         Ok(bytes::Bytes::from(merged_str))
     }
+
+    /// Get-or-create the per-worker combine-admission semaphore for `url`.
+    /// Same url returns the same semaphore (shared cap); first use lazily
+    /// creates it at `pic_max_combine_inflight`, so dynamic worker add/remove
+    /// needs no startup enumeration.
+    fn combine_permit_sem(&self, url: &str) -> Arc<tokio::sync::Semaphore> {
+        let mut map = self
+            .pic_combine_sems
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(url.to_string())
+            .or_insert_with(|| {
+                Arc::new(tokio::sync::Semaphore::new(self.pic_max_combine_inflight))
+            })
+            .clone()
+    }
+
+    /// PIC scatter pre-step. Returns `Some(response)` if the request was handled
+    /// as a scatter+combine dispatch; `None` to fall through to the normal PD path.
+    ///
+    /// Gate: `pic_round_robin` policy (pic_separator set) AND body.text contains
+    /// the separator AND >=2 segments. The last segment is the combine query Q
+    /// (sent through the normal PD pair); segments [0..k) are fired fire-and-forget
+    /// to prefill workers as single-segment scatter sub-requests.
+    ///
+    /// ponytail: only `/generate` with a plain `text` field is scattered;
+    /// chat/completion scatter is not implemented. Segment→worker assignment is
+    /// directory-aware (see `assign_with_directory`).
+    async fn scatter_prefill(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &GenerateRequest,
+        model_id: Option<&str>,
+    ) -> Option<Response> {
+        let sep = self.pic_separator.as_deref()?;
+        let text = body.text.as_deref()?;
+        if !text.contains(sep) {
+            return None;
+        }
+        // ponytail: drop empty/whitespace segments so the router scatters only
+        // real segments and its last == the engine's Q (engine's segmenter also
+        // drops empties; positional seg_index must agree on the non-empty set).
+        let segments: Vec<&str> = crate::policies::pic::split_segments(text, sep)
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        if segments.len() < 2 {
+            return None;
+        }
+
+        // Select the combine (C, used as prefill) + decode (D) pair once.
+        let (combine, decode) = match self
+            .select_pd_pair(Some(text), model_id, headers)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => return Some(Self::handle_server_selection_error(e)),
+        };
+        let combine_addr = combine.url().to_string();
+
+        // PIC combine admission gate: cap concurrent scatter requests for which
+        // this worker is the combine role. Fair FIFO backpressure — when the
+        // worker is at cap, this awaits until a slot frees, holding no other
+        // lock (no deadlock). The permit is held (RAII) through the scatter
+        // fan-out and the combine dispatch await below, and released on every
+        // exit path of scatter_prefill when it drops at end of scope.
+        // ponytail: combine-role only. Capacity assumption: cap * n_workers
+        // requests, each ~k segments spread over workers, keeps per-worker mamba
+        // under the pool (384). Upgrade path if a scatter worker still exhausts:
+        // add a per-scatter-worker cap or lower PIC_MAX_COMBINE_INFLIGHT.
+        let _combine_permit = self
+            .combine_permit_sem(&combine_addr)
+            .acquire_owned()
+            .await
+            .ok();
+
+        // Last segment is the combine query Q; scatter the first k = n-1.
+        let scatter_segs = &segments[..segments.len() - 1];
+        let prefill_workers = self.worker_registry.get_prefill_workers();
+        if prefill_workers.is_empty() {
+            return Some(Self::handle_server_selection_error(
+                "No prefill workers available for PIC scatter".to_string(),
+            ));
+        }
+        // Directory-aware assignment: hit -> holder (direct transfer, no warmup),
+        // miss -> round-robin + optimistic insert. url -> Worker lookup so the
+        // returned holder url maps back to the worker we actually POST to.
+        let prefill_worker_urls: Vec<&str> =
+            prefill_workers.iter().map(|w| w.url()).collect();
+        let assigned_urls = {
+            let mut state_guard = self
+                .pic_route_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::policies::pic::assign_with_directory(
+                scatter_segs,
+                &prefill_worker_urls,
+                &mut state_guard,
+                self.pic_lpt,
+            )
+        };
+        let worker_by_url: std::collections::HashMap<&str, &Arc<dyn Worker>> =
+            prefill_workers.iter().map(|w| (w.url(), w)).collect();
+
+        // Fire each scatter sub-request fire-and-forget; collect the combine table.
+        let mut pic_combine = Vec::with_capacity(scatter_segs.len());
+        for (seg_index, seg_text) in scatter_segs.iter().enumerate() {
+            let worker_addr = assigned_urls[seg_index].clone();
+            // ponytail: a directory hit can name a url that's since been removed
+            // from the registry; fall back to the first prefill worker so the
+            // sub-request still lands (the 60s rebuild will drop the stale entry).
+            let worker = worker_by_url
+                .get(worker_addr.as_str())
+                .copied()
+                .unwrap_or(&prefill_workers[0]);
+            let worker_addr = worker.url().to_string();
+            let room = super::pd_types::generate_room_id();
+
+            let sub_body = json!({
+                "text": seg_text,
+                "pic_scatter_single_seg": true,
+                "pic_scatter_meta": {
+                    "combine_addr": combine_addr,
+                    "scatter_room": room,
+                    "seg_index": seg_index,
+                },
+            });
+
+            let req = self.build_post_with_headers(
+                &self.client,
+                &worker_addr,
+                "/generate",
+                &sub_body,
+                headers,
+                false,
+            );
+            // ponytail: fire-and-forget — combine side blocks on RDMA arrival, so
+            // we only need the sub-request to land, not to complete here.
+            tokio::spawn(async move {
+                if let Err(e) = req.send().await {
+                    warn!("PIC scatter sub-request to {} failed: {}", worker_addr, e);
+                }
+            });
+
+            pic_combine.push(json!({
+                "seg_index": seg_index,
+                "worker_addr": worker.url().to_string(),
+                "room": room,
+            }));
+        }
+
+        // Build the combine body: original request + pic_combine table, query = Q.
+        let mut combine_body = match serde_json::to_value(body) {
+            Ok(v) => v,
+            Err(e) => return Some(Self::handle_serialization_error(e)),
+        };
+        if let Some(obj) = combine_body.as_object_mut() {
+            // combine carries the FULL prompt; engine composes scattered hits + prefills Q (design §2).
+            obj.insert("pic_combine".to_string(), Value::Array(pic_combine));
+        }
+
+        // Dispatch combine body through the same PD machinery, pinning C/D.
+        let context = PDRequestContext {
+            route: "/generate",
+            batch_size: Self::get_generate_batch_size(body),
+            is_stream: body.stream,
+            return_logprob: body.return_logprob.unwrap_or(false),
+            request_text: Some(text.to_string()),
+            model_id,
+            headers: headers.cloned(),
+        };
+        let json_request = match Self::inject_bootstrap_into_value(
+            combine_body,
+            combine.as_ref(),
+            context.batch_size,
+        ) {
+            Ok(v) => v,
+            Err(e) => return Some(Self::handle_serialization_error(e)),
+        };
+        Some(
+            self.execute_dual_dispatch_internal(
+                headers,
+                json_request,
+                context,
+                combine,
+                decode,
+                Instant::now(),
+            )
+            .await,
+        )
+    }
 }
 
 #[async_trait]
@@ -1410,6 +1720,12 @@ impl RouterTrait for PDRouter {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
+        // ponytail: seg<2 or non-pic policy -> fully native PD (single-machine
+        // PIC), zero branch side-effects.
+        if let Some(resp) = self.scatter_prefill(headers, body, model_id).await {
+            return resp;
+        }
+
         let is_stream = body.stream;
         let return_logprob = body.return_logprob.unwrap_or(false);
 
@@ -1471,6 +1787,39 @@ impl RouterTrait for PDRouter {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        // PIC scatter for /v1/completions: if a pic policy is active and the
+        // prompt is a single string containing the separator, synthesize a
+        // GenerateRequest and reuse scatter_prefill (combine dispatches to
+        // /generate); reshape the /generate SSE back to completion shape.
+        // ponytail: keeps pic policy consistent across /generate and
+        // /v1/completions instead of silently no-op'ing here.
+        if let Some(sep) = self.pic_separator.as_deref() {
+            if let StringOrArray::String(prompt) = &body.prompt {
+                if prompt.contains(sep) {
+                    let synth: GenerateRequest = serde_json::from_value(serde_json::json!({
+                        "text": prompt,
+                        "sampling_params": super::pic_completion::completion_sampling_params(body),
+                        "stream": body.stream,
+                    }))
+                    .expect("synth GenerateRequest from completion");
+                    if let Some(gen_resp) = self.scatter_prefill(headers, &synth, model_id).await {
+                        let include_usage = body
+                            .stream_options
+                            .as_ref()
+                            .and_then(|o| o.include_usage)
+                            .unwrap_or(false);
+                        return super::pic_completion::reshape_generate_to_completion(
+                            gen_resp,
+                            body.model.clone(),
+                            body.stream,
+                            include_usage,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+
         let is_stream = body.stream;
         let return_logprob = body.logprobs.is_some();
 
@@ -1564,6 +1913,10 @@ mod tests {
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
     fn create_test_pd_router() -> PDRouter {
+        create_test_pd_router_with_cap(8)
+    }
+
+    fn create_test_pd_router_with_cap(cap: usize) -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry =
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
@@ -1575,7 +1928,49 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            pic_separator: None,
+            pic_lpt: false,
+            pic_route_state: Arc::new(std::sync::Mutex::new(
+                crate::policies::pic::PicRouteState::new(),
+            )),
+            pic_combine_sems: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pic_max_combine_inflight: cap,
         }
+    }
+
+    #[tokio::test]
+    async fn test_combine_permit_sem_gate() {
+        let router = create_test_pd_router_with_cap(2);
+
+        // Same url -> same semaphore (shared cap); different url -> distinct.
+        let a1 = router.combine_permit_sem("http://w1");
+        let a2 = router.combine_permit_sem("http://w1");
+        let b1 = router.combine_permit_sem("http://w2");
+        assert!(Arc::ptr_eq(&a1, &a2), "same url must share one semaphore");
+        assert!(!Arc::ptr_eq(&a1, &b1), "different urls must not share");
+
+        // Cap enforced: 2 permits acquire, the 3rd is refused while held.
+        assert_eq!(a1.available_permits(), 2);
+        let p1 = a1.clone().try_acquire_owned().expect("permit 1");
+        let p2 = a1.clone().try_acquire_owned().expect("permit 2");
+        assert_eq!(a1.available_permits(), 0);
+        assert!(
+            a1.clone().try_acquire_owned().is_err(),
+            "3rd acquire must be refused at cap"
+        );
+
+        // Dropping a held permit frees a slot (FIFO wake is provided by tokio).
+        drop(p1);
+        assert_eq!(a1.available_permits(), 1);
+        let _p3 = a1.clone().try_acquire_owned().expect("permit after release");
+        assert_eq!(a1.available_permits(), 0);
+
+        // A different worker's semaphore is independent.
+        assert_eq!(b1.available_permits(), 2);
+
+        drop(p2);
     }
 
     fn create_test_worker(url: String, worker_type: WorkerType, healthy: bool) -> Box<dyn Worker> {

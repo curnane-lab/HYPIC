@@ -1,9 +1,35 @@
 import logging
-from typing import Optional, Union
+import os
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+
+
+def derotate_kv(
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool = True,
+) -> torch.Tensor:
+    """Reverse rotary: rotate K from current position back to position 0.
+
+    R(-pos) = R(pos)^{-1}, achieved by negating sin.
+    """
+    return apply_rotary_emb(k, cos, -sin, is_neox_style)
+
+
+def rerotate_kv(
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool = True,
+) -> torch.Tensor:
+    """Apply rotary to position-0-stored K to reach a new position."""
+    return apply_rotary_emb(k, cos, sin, is_neox_style)
+
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
@@ -19,11 +45,85 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.pic.policy import PICCompose
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.utils import is_cpu
+
+
+def _derotate_with_partial(x, cos, sin, rotary_dim, head_dim, is_neox, derotate_fn):
+    """Apply derotate_kv to x, handling partial rotary (rotary_dim < head_dim)."""
+    if rotary_dim < head_dim:
+        x_rot = x[..., :rotary_dim]
+        x_pass = x[..., rotary_dim:]
+        x_rot = derotate_fn(x_rot, cos.to(x_rot.dtype), sin.to(x_rot.dtype), is_neox)
+        return torch.cat([x_rot, x_pass], dim=-1)
+    return derotate_fn(x, cos.to(x.dtype), sin.to(x.dtype), is_neox)
+
+
+def _rerotate_with_partial(x, cos, sin, rotary_dim, head_dim, is_neox, rerotate_fn):
+    """Apply rerotate_kv to x, handling partial rotary (rotary_dim < head_dim)."""
+    if rotary_dim < head_dim:
+        x_rot = x[..., :rotary_dim]
+        x_pass = x[..., rotary_dim:]
+        x_rot = rerotate_fn(x_rot, cos.to(x_rot.dtype), sin.to(x_rot.dtype), is_neox)
+        return torch.cat([x_rot, x_pass], dim=-1)
+    return rerotate_fn(x, cos.to(x.dtype), sin.to(x.dtype), is_neox)
+
+if not is_cpu():
+    from sglang.srt.layers.attention.fla.chunk_delta_h import (
+        CHUNK_SIZE as FLA_CHUNK_SIZE,
+    )
 
 logger = logging.getLogger(__name__)
+
+
+def _moti2_rank() -> int:
+    try:
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank()
+    except Exception:
+        return 0
+
+
+def _dump_moti2_context_kv(
+    layer,
+    q,
+    kv_buf,
+    kv_indices,
+    positions,
+    qo_indptr=None,
+    kv_indptr=None,
+    kv_positions=None,
+):
+    dump_dir = os.environ.get("PIC_MOTI2_DUMP_DIR")
+    if not dump_dir:
+        return
+    if q.shape[0] < int(os.environ.get("PIC_MOTI2_MIN_TOKENS", "0")):
+        return
+    os.makedirs(dump_dir, exist_ok=True)
+    rank = _moti2_rank()
+    idx = kv_indices.detach().to(torch.long)
+    k_buf, v_buf = kv_buf
+    torch.save(
+        {
+            "layer": int(layer.layer_id),
+            "rank": int(rank),
+            "q": q.detach().view(q.shape[0], layer.tp_q_head_num, layer.head_dim).to(torch.float32).cpu(),
+            "k": k_buf.index_select(0, idx).detach().to(torch.float32).cpu(),
+            "v": v_buf.index_select(0, idx).detach().to(torch.float32).cpu(),
+            "positions": positions.detach().cpu() if positions is not None else None,
+            "kv_indices": idx.cpu(),
+            "qo_indptr": qo_indptr.detach().cpu() if qo_indptr is not None else None,
+            "kv_indptr": kv_indptr.detach().cpu() if kv_indptr is not None else None,
+            "kv_positions": kv_positions.detach().cpu()
+            if kv_positions is not None
+            else None,
+        },
+        os.path.join(dump_dir, f"qwen_attn_plan_L{int(layer.layer_id):03d}_r{rank}.pt"),
+    )
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -701,6 +801,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         full_attn_backend: AttentionBackend,
         linear_attn_backend: MambaAttnBackendBase,
         full_attn_layers: list[int],
+        model_runner: Optional[ModelRunner] = None,
     ):
         self.full_attn_layers = full_attn_layers
         self.full_attn_backend = full_attn_backend
@@ -714,6 +815,43 @@ class HybridLinearAttnBackend(AttentionBackend):
             full_attn_backend.needs_cpu_seq_lens
             or linear_attn_backend.needs_cpu_seq_lens
         )
+        self._pic_prefill_wrapper = None
+        self._pic_workspace = None
+        # T1 fix: keep wrapper instance alive across batches; this flag gates
+        # whether the current batch has any PIC miss segments needing the plan.
+        self._pic_has_plan = False
+        # transition_rope: dedicated wrappers for Phase A (local isolated) and
+        # Phase C (global cross-seg). See _init_pic_rope_plans.
+        self._pic_rope_local_wrapper = None
+        self._pic_rope_global_wrapper = None
+        self._pic_rope_has_local_plan = False
+        self._pic_rope_has_global_plan = False
+        self._pic_rope_local_plan_ready = False
+        self._pic_rope_global_plan_ready = False
+        self._pic_rope_phase_c_cache = None
+        self._pic_rope_phase_b_cache = None
+        self._pic_rope_cross_real_cache = None
+        # For transition_rope: rotary embedding cache (lazily initialized)
+        self._pic_rope_cos_sin_cache = None
+        self._pic_rope_is_neox = True
+        self._pic_rope_rotary_dim = 0
+        self._model_runner = model_runner
+
+    def _pic_is_bailing_linear_model(self) -> bool:
+        if self._model_runner is None:
+            return False
+        model_config = getattr(self._model_runner, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        if hf_config is None:
+            return False
+        archs = set(getattr(hf_config, "architectures", []) or [])
+        return bool(
+            archs
+            & {
+                "BailingMoeLinearV2ForCausalLM",
+                "BailingMoELinearForCausalLM",
+            }
+        ) or getattr(hf_config, "model_type", None) == "bailing_moe_linear"
 
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
@@ -741,6 +879,28 @@ class HybridLinearAttnBackend(AttentionBackend):
             return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
+        if getattr(forward_batch, "pic_mode", None) is not None:
+            # transition_rope uses dedicated dual-wrapper plans (Phase A local
+            # isolated, Phase C global cross-seg). All other modes share the
+            # original per-segment plan.
+            if forward_batch.pic_policy.rope:
+                if self._pic_rope_cos_sin_cache is None:
+                    self._init_pic_rope_cache()
+                self._init_pic_rope_plans(forward_batch)
+                if self._pic_rope_use_cross_segment_full_attn(forward_batch):
+                    self._init_pic_prefill_plan(forward_batch)
+                else:
+                    # The shared single wrapper is not used in rope mode.
+                    self._pic_has_plan = False
+            else:
+                self._init_pic_prefill_plan(forward_batch)
+            # init_pic_metadata deferred to first GDN layer call
+            self._pic_gdn_metadata_ready = False
+            linear_needs_rope = bool(
+                getattr(self.linear_attn_backend, "pic_state_needs_rope_rerotate", False)
+            )
+            if linear_needs_rope and self._pic_rope_cos_sin_cache is None:
+                self._init_pic_rope_cache()
 
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
@@ -823,14 +983,44 @@ class HybridLinearAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
-        q: Optional[torch.Tensor] = None,  # For full attention
-        k: Optional[torch.Tensor] = None,  # For full attention
-        v: Optional[torch.Tensor] = None,  # For full attention
-        mixed_qkv: Optional[torch.Tensor] = None,  # For linear attention
-        a: Optional[torch.Tensor] = None,  # For GDN linear attention
-        b: Optional[torch.Tensor] = None,  # For GDN linear attention
+        q: Optional[torch.Tensor] = None,
+        k: Optional[torch.Tensor] = None,
+        v: Optional[torch.Tensor] = None,
+        mixed_qkv: Optional[torch.Tensor] = None,
+        a: Optional[torch.Tensor] = None,
+        b: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        # PIC dispatch: route through mode-specific paths; leave
+        # the non-PIC path untouched so existing requests keep working.
+        if getattr(forward_batch, "pic_mode", None) is not None:
+            if forward_batch.pic_policy.compose is PICCompose.ADDITION:
+                return self._forward_extend_pic_addition(
+                    layer,
+                    forward_batch,
+                    save_kv_cache,
+                    q=q,
+                    k=k,
+                    v=v,
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    **kwargs,
+                )
+            # TRANSITION family: transition / transition_rope / transition_rope_recompute.
+            return self._forward_extend_pic_transition_family(
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q=q,
+                k=k,
+                v=v,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                **kwargs,
+            )
+
         if self._is_full_attn(layer, kwargs.get("layer_id")):
             return self.full_attn_backend.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
@@ -847,6 +1037,1374 @@ class HybridLinearAttnBackend(AttentionBackend):
             a=a,
             b=b,
             **kwargs,
+        )
+
+    def _pic_linear_rope_kwargs(self, forward_batch: ForwardBatch) -> dict:
+        """Bundle PIC mode + RoPE cache for linear backends that need it."""
+        if not getattr(self.linear_attn_backend, "pic_state_needs_rope_rerotate", False):
+            return {"pic_mode": getattr(forward_batch, "pic_mode", None)}
+        if self._pic_rope_cos_sin_cache is None:
+            self._init_pic_rope_cache()
+        return {
+            "pic_mode": getattr(forward_batch, "pic_mode", None),
+            "pic_rope_cos_sin_cache": self._pic_rope_cos_sin_cache,
+            "pic_rope_is_neox": self._pic_rope_is_neox,
+            "pic_rope_rotary_dim": self._pic_rope_rotary_dim,
+        }
+
+    def _pic_rope_use_cross_segment_full_attn(self, forward_batch: ForwardBatch) -> bool:
+        """Use Ring/Bailing's less lossy full-attn transition_rope path.
+
+        The clean Qwen path computes local miss segments with isolated
+        per-segment attention. Ring's hybrid stack is much more sensitive to
+        those local full-attn hidden differences, so for Bailing/Ring we keep
+        the RoPE K correction but run the normal cross-segment PIC full-attn
+        plan over private real-position slots.
+        """
+        if getattr(forward_batch, "pic_mode", None) not in (
+            "transition_rope", "transition_rope_recompute",
+        ):
+            return False
+        return self._pic_is_bailing_linear_model()
+
+    def _forward_extend_pic_addition(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+        q: Optional[torch.Tensor] = None,
+        k: Optional[torch.Tensor] = None,
+        v: Optional[torch.Tensor] = None,
+        mixed_qkv: Optional[torch.Tensor] = None,
+        a: Optional[torch.Tensor] = None,
+        b: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """PIC lapic_addition dispatch for hybrid (full-attn + linear-attn) layers.
+
+        Full-attn layers:
+          Dispatches to ``_forward_extend_pic_full_attn`` which uses a dedicated
+          FlashInfer BatchPrefillWithPagedKVCacheWrapper with per-segment
+          qo_indptr/kv_indptr. Each miss segment is an independent "request"
+          in the varlen batch; Q attends only to K/V slots at [0, seg_end)
+          ensuring correct causal masking. Plan is built once per batch in
+          ``_init_pic_prefill_plan`` and reused across all full-attn layers.
+          Note: no RoPE correction — cached KV retains original positions.
+
+        Linear-attn (GDN) layers:
+          Dispatches to ``linear_attn_backend.forward_extend_pic_addition``
+          which treats each miss segment as an independent sequence in a
+          varlen batch (via seg_cu_seqlens). Conv1d + GDN kernel run once
+          over all segments with initial_state=zeros (per-segment S=0).
+          After the kernel, a fused Triton gather+sum kernel accumulates
+          hit-segment states (from MambaPool) + miss-segment states into
+          S_total per request, and persists non-last miss segment states
+          to their pre-allocated cache slots.
+        """
+        layer_id = layer.layer_id if layer else kwargs["layer_id"]
+        if layer_id in self.full_attn_layers:
+            return self._forward_extend_pic_full_attn(
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+            )
+        # Linear-attn (GDN) layers: per-segment kernel calls + state summation.
+        if not self._pic_gdn_metadata_ready:
+            self.linear_attn_backend.init_pic_metadata(forward_batch)
+            self._pic_gdn_metadata_ready = True
+        merged_kwargs = {**kwargs, **self._pic_linear_rope_kwargs(forward_batch)}
+        return self.linear_attn_backend.forward_extend_pic_addition(
+            layer=layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            q=q,
+            k=k,
+            v=v,
+            **merged_kwargs,
+        )
+
+    def _forward_extend_pic_transition_family(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+        q: Optional[torch.Tensor] = None,
+        k: Optional[torch.Tensor] = None,
+        v: Optional[torch.Tensor] = None,
+        mixed_qkv: Optional[torch.Tensor] = None,
+        a: Optional[torch.Tensor] = None,
+        b: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """PIC transition-family dispatch (transition / transition_rope / recompute).
+
+        Full-attn layers:
+          rope=False (transition): no RoPE correction; per-segment FlashInfer plan
+            (same as addition mode).
+          rope=True (transition_rope[_recompute]): re-rotate hit-seg K to real
+            positions before attention (cross-segment variant when applicable).
+
+        Linear-attn (GDN / Lightning) layers:
+          Position-independent, so identical across the family; dispatches to the
+          shared linear_attn_backend.forward_extend_pic_transition, which itself
+          self-routes to the recompute path when policy.recompute.
+        """
+        layer_id = layer.layer_id if layer else kwargs["layer_id"]
+        if layer_id in self.full_attn_layers:
+            if not forward_batch.pic_policy.rope:
+                return self._forward_extend_pic_full_attn(
+                    q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+                )
+            if self._pic_rope_use_cross_segment_full_attn(forward_batch):
+                return self._forward_extend_pic_full_attn_rope_cross_segment(
+                    q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+                )
+            return self._forward_extend_pic_full_attn_rope(
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+            )
+        # Linear-attn (GDN / Lightning) layers: shared transition path.
+        if not self._pic_gdn_metadata_ready:
+            self.linear_attn_backend.init_pic_metadata(forward_batch)
+            self._pic_gdn_metadata_ready = True
+        merged_kwargs = {**kwargs, **self._pic_linear_rope_kwargs(forward_batch)}
+        return self.linear_attn_backend.forward_extend_pic_transition(
+            layer=layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            q=q,
+            k=k,
+            v=v,
+            **merged_kwargs,
+        )
+
+    def _forward_extend_pic_full_attn_rope_cross_segment(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        """Ring/Bailing transition_rope full-attn path.
+
+        Prepare private slots at real positions for all visible segments, while
+        still writing local-miss public slots in segment-anchored form so future
+        requests can reuse them. Then run the normal cross-segment PIC prefill
+        attention plan.
+        """
+
+        rope_meta = getattr(forward_batch, "pic_rope_meta", None)
+        if rope_meta is None:
+            return q.new_zeros(0, layer.tp_q_head_num * layer.head_dim)
+
+        device = q.device
+        head_dim = layer.head_dim
+        rotary_dim = self._pic_rope_rotary_dim
+        is_neox = self._pic_rope_is_neox
+        cos_sin_cache = self._pic_rope_cos_sin_cache
+        token_to_kv_pool = self.token_to_kv_pool
+        layer_id = layer.layer_id
+        k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
+        v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
+        q3 = q.view(-1, layer.tp_q_head_num, head_dim)
+        k3 = k.view(-1, layer.tp_k_head_num, head_dim)
+        v3 = v.view(-1, layer.tp_k_head_num, head_dim)
+
+        cache = self._pic_rope_cross_real_cache
+        if cache is None:
+            cache = self._build_pic_rope_cross_real_cache(rope_meta, device)
+            self._pic_rope_cross_real_cache = cache
+        assert cache["expected_q_rows"] == q3.shape[0], (
+            f"PIC rope cross-segment mapped {cache['expected_q_rows']} q rows, "
+            f"expected {q3.shape[0]}"
+        )
+
+        miss_q = cache["miss_q"]
+        if miss_q.numel() > 0:
+            k_miss = k3.index_select(0, miss_q)
+            v_miss = v3.index_select(0, miss_q)
+            k_buffer[cache["miss_pub"]] = k_miss
+            v_buffer[cache["miss_pub"]] = v_miss
+            k_buffer[cache["miss_priv"]] = k_miss
+            v_buffer[cache["miss_priv"]] = v_miss
+
+        global_q = cache["global_q"]
+        if global_q.numel() > 0:
+            k_global = k3.index_select(0, global_q)
+            v_global = v3.index_select(0, global_q)
+            k_buffer[cache["global_slots"]] = k_global
+            v_buffer[cache["global_slots"]] = v_global
+
+        hit_priv = cache["hit_priv"]
+        if hit_priv.numel() > 0:
+            hit_entry = cache["hit_entry"]
+            k_buffer[hit_priv] = k_buffer.index_select(0, hit_entry)
+            v_buffer[hit_priv] = v_buffer.index_select(0, hit_entry)
+
+        wrapper = self._pic_prefill_wrapper
+        if not self._pic_has_plan or wrapper is None:
+            return q.new_zeros(0, layer.tp_q_head_num * layer.head_dim)
+
+        if not self._pic_plan_ready:
+            wrapper.begin_forward(
+                qo_indptr=self._pic_qo_indptr,
+                paged_kv_indptr=self._pic_kv_indptr,
+                paged_kv_indices=self._pic_kv_indices,
+                paged_kv_last_page_len=self._pic_kv_last_page_len,
+                num_qo_heads=layer.tp_q_head_num,
+                num_kv_heads=layer.tp_k_head_num,
+                head_dim_qk=layer.head_dim,
+                page_size=1,
+                causal=True,
+                q_data_type=q.dtype,
+            )
+            self._pic_plan_ready = True
+
+        kv_buf = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        _dump_moti2_context_kv(
+            layer,
+            q,
+            kv_buf,
+            self._pic_kv_indices,
+            forward_batch.positions,
+            self._pic_qo_indptr,
+            self._pic_kv_indptr,
+            self._pic_kv_positions,
+        )
+        o = wrapper.forward(
+            q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            kv_buf,
+            causal=True,
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _build_pic_rope_cross_real_cache(
+        self,
+        rope_meta: List[Dict[str, object]],
+        device: torch.device,
+    ) -> Dict[str, object]:
+        miss_q: List[int] = []
+        global_q: List[int] = []
+        miss_pub_chunks: List[torch.Tensor] = []
+        miss_priv_chunks: List[torch.Tensor] = []
+        global_slot_chunks: List[torch.Tensor] = []
+        hit_priv_chunks: List[torch.Tensor] = []
+        hit_entry_chunks: List[torch.Tensor] = []
+        cursor = 0
+
+        for meta in rope_meta:
+            entries = []
+            for start, end, _priv, _pub in meta["local_miss"]:
+                entries.extend(range(int(start), int(end)))
+            global_info = meta["global"]
+            if global_info is not None:
+                gs, ge, _gp = global_info
+                entries.extend(range(int(gs), int(ge)))
+            # Include seam tokens (hit-segment sink positions) in the
+            # q-row mapping so the cross-segment attention plan covers them.
+            seam_info = meta.get("seam") if isinstance(meta, dict) else None
+            if seam_info is not None:
+                hit_seam = seam_info.get("hit_seam", {})
+                for (_s, _e), sink_pos in hit_seam.items():
+                    entries.extend(int(p) for p in sink_pos)
+            entries.sort()
+            abs_to_q = {pos: cursor + i for i, pos in enumerate(entries)}
+            cursor += len(entries)
+
+            for start, end, priv, pub in meta["local_miss"]:
+                miss_q.extend(abs_to_q[int(start) + ofs] for ofs in range(end - start))
+                miss_pub_chunks.append(pub.to(device).to(torch.int64))
+                miss_priv_chunks.append(priv.to(device).to(torch.int64))
+
+            if global_info is not None:
+                gs, ge, gp = global_info
+                global_q.extend(abs_to_q[int(gs) + ofs] for ofs in range(ge - gs))
+                global_slot_chunks.append(gp.to(device).to(torch.int64))
+
+            for _start, _end, priv, entry_pub in meta["local_hit"]:
+                hit_priv_chunks.append(priv.to(device).to(torch.int64))
+                hit_entry_chunks.append(entry_pub.to(device).to(torch.int64))
+
+        empty = torch.empty(0, dtype=torch.int64, device=device)
+        return {
+            "expected_q_rows": cursor,
+            "miss_q": torch.tensor(miss_q, dtype=torch.int64, device=device)
+            if miss_q
+            else empty,
+            "miss_pub": torch.cat(miss_pub_chunks, dim=0)
+            if miss_pub_chunks
+            else empty,
+            "miss_priv": torch.cat(miss_priv_chunks, dim=0)
+            if miss_priv_chunks
+            else empty,
+            "global_q": torch.tensor(global_q, dtype=torch.int64, device=device)
+            if global_q
+            else empty,
+            "global_slots": torch.cat(global_slot_chunks, dim=0)
+            if global_slot_chunks
+            else empty,
+            "hit_priv": torch.cat(hit_priv_chunks, dim=0)
+            if hit_priv_chunks
+            else empty,
+            "hit_entry": torch.cat(hit_entry_chunks, dim=0)
+            if hit_entry_chunks
+            else empty,
+        }
+
+    def _forward_extend_pic_full_attn_rope(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        """PIC transition_rope full-attn: per-segment isolated semantics.
+
+        Per-layer, three phases (see qianyou/2026-06-07-pic-transition-rope-
+        isolated-design.md):
+
+          Phase A (LOCAL ISOLATED, pos=0):
+            For every local miss + local hit token, compute attention with
+            Q and K placed at pos=0 and K visibility restricted to the same
+            segment (causal within segment, no cross-segment). The pos=0 K
+            for local miss is derived by derotating the model-provided
+            real-pos K. The pos=0 K for local hit comes from entry.full_kv_slots
+            (already pos=0 by construction).
+            Local miss Q is derotated to pos=0; the pos=0 K (derotated) is
+            written to BOTH public and private (private is overwritten in
+            Phase B). The phase output for local miss tokens is the final
+            attention output for those tokens.
+            Local hit tokens have no Q (they are cache-only), but their K
+            is loaded into the FlashInfer plan as visible context for the
+            (no) local hit Q — this phase produces no output for hit tokens.
+
+          Phase B (REROTATE → PRIVATE @ real pos):
+            Local miss: read public K (pos=0), rerotate to real pos, write
+              to private K. Copy V from public to private.
+            Local hit:  read entry public K (pos=0), rerotate to real pos,
+              write to private K. Copy V from entry public to private.
+
+          Phase C (GLOBAL CROSS-SEG, real pos):
+            Global tokens use real-pos Q and real-pos K (model already
+            rope-applied them; save them to global's private slot).
+            Build a single-segment plan whose K visibility is concat of all
+            private slots in real-pos order: [seg_1_priv, seg_2_priv, ...,
+            global_priv]. Causal mask handles within-global ordering.
+            Output is written to the global tokens.
+
+        Final output (concatenated over all miss tokens, matching input_ids
+        order): local-miss-token outputs from Phase A, global-token outputs
+        from Phase C.
+        """
+        rope_meta = getattr(forward_batch, "pic_rope_meta", None)
+        if rope_meta is None:
+            return q.new_zeros(0, layer.tp_q_head_num * layer.head_dim)
+
+        device = q.device
+        head_dim = layer.head_dim
+        num_q_heads = layer.tp_q_head_num
+        num_kv_heads = layer.tp_k_head_num
+        token_to_kv_pool = self.token_to_kv_pool
+        layer_id = layer.layer_id
+
+        q3 = q.view(-1, num_q_heads, head_dim)
+        k3 = k.view(-1, num_kv_heads, head_dim) if k is not None else None
+        v3 = v.view(-1, num_kv_heads, head_dim) if v is not None else None
+        T = q3.shape[0]
+        o_buf = q3.new_zeros(T, num_q_heads, head_dim)
+
+        # input_ids order is real-pos sorted (per req). For each token at q_index k,
+        # its absolute position is the k-th element of the per-req sorted abs_pos list.
+        # Here we build:
+        #   - miss_token_role[k] = (req_idx, kind)  kind: 0 local miss, 1 global, 2 hit seam
+        #   - local_q_indices: q-indices of local-miss tokens in rope_meta seg-walk order
+        #   - global_q_indices: q-indices of global tokens in rope_meta order
+        #   - hit_seam_q_info: list of (q_index, req_idx, (s,e), local_ofs)
+        is_recompute = forward_batch.pic_policy.recompute
+        miss_token_role: List[Tuple[int, int]] = []
+        miss_token_seg_idx_in_req_local: List[int] = []
+        # Per-req: abs_pos -> q_index
+        per_req_abs_to_q: List[Dict[int, int]] = []
+        # Reverse map: q_index -> (req_idx, abs_pos). Reset per forward (this
+        # function is the canonical entry point for transition_rope full-attn
+        # — Phase A/B/C all read from a cache built off rope_meta, never from
+        # cross-batch state). Used by Phase C cache builder to bucket and sort
+        # Q rows by abs_pos.
+        self._pic_q_to_req_abs_dict: Dict[int, Tuple[int, int]] = {}
+        cursor = 0
+        for req_idx, meta in enumerate(rope_meta):
+            local_miss = meta["local_miss"]
+            global_info = meta["global"]
+            seam_info = meta.get("seam") if isinstance(meta, dict) else None
+            # Collect this req's abs_pos list with kind labels.
+            entries: List[Tuple[int, int, object]] = []  # (abs_pos, kind, payload)
+            for li, (start, end, _priv, _pub) in enumerate(local_miss):
+                for ofs in range(end - start):
+                    entries.append((start + ofs, 0, li))
+            if global_info is not None:
+                (gs, ge, _gp) = global_info
+                for ofs in range(ge - gs):
+                    entries.append((gs + ofs, 1, -1))
+            if is_recompute and seam_info is not None:
+                hit_seam = seam_info.get("hit_seam", {})
+                for (s, e), sink_pos in hit_seam.items():
+                    for j, ap in enumerate(sink_pos):
+                        entries.append((ap, 2, ((s, e), j)))
+            entries.sort(key=lambda x: x[0])
+            abs_to_q: Dict[int, int] = {}
+            for (ap, kind, _payload) in entries:
+                abs_to_q[ap] = cursor
+                self._pic_q_to_req_abs_dict[cursor] = (req_idx, ap)
+                miss_token_role.append((req_idx, kind))
+                miss_token_seg_idx_in_req_local.append(-1)  # backfill below
+                cursor += 1
+            per_req_abs_to_q.append(abs_to_q)
+
+        assert len(miss_token_role) == T, (
+            f"miss-token count mismatch: rope_meta says {len(miss_token_role)}, q has {T}"
+        )
+
+        # Build seg-walk-ordered q-index lists by looking up abs_pos -> q.
+        local_q_indices: List[int] = []
+        global_q_indices: List[int] = []
+        hit_seam_q_info: List[Tuple[int, int, Tuple[int, int], int]] = []
+        for req_idx, meta in enumerate(rope_meta):
+            abs_to_q = per_req_abs_to_q[req_idx]
+            local_miss = meta["local_miss"]
+            global_info = meta["global"]
+            for li, (start, end, _priv, _pub) in enumerate(local_miss):
+                for ofs in range(end - start):
+                    qi = abs_to_q[start + ofs]
+                    local_q_indices.append(qi)
+                    miss_token_seg_idx_in_req_local[qi] = li
+            if global_info is not None:
+                (gs, ge, _gp) = global_info
+                for ofs in range(ge - gs):
+                    global_q_indices.append(abs_to_q[gs + ofs])
+            seam_info = meta.get("seam") if isinstance(meta, dict) else None
+            if is_recompute and seam_info is not None:
+                hit_seam = seam_info.get("hit_seam", {})
+                for (s, e), sink_pos in hit_seam.items():
+                    for j, ap in enumerate(sink_pos):
+                        hit_seam_q_info.append((abs_to_q[ap], req_idx, (s, e), j))
+        hit_seam_q_indices = [info[0] for info in hit_seam_q_info]
+
+        # Phase A — kv-only writer
+        # (miss-seg query attention is deferred to Phase C with cross-seg KV).
+        if local_q_indices or any(meta["local_hit"] for meta in rope_meta):
+            self._pic_rope_phase_a_kv_only(
+                q3, k3, v3, layer, forward_batch, rope_meta,
+                local_q_indices,
+            )
+
+        # Phase B — REROTATE private to real pos
+        self._pic_rope_phase_b(layer, forward_batch, rope_meta)
+
+        # Phase C — cross-seg @ real pos. Miss-seg query (local_q_indices)
+        # joins global Q to attend over ALL prior segs' private slots.
+        phase_c_local_q = local_q_indices
+        if global_q_indices or hit_seam_q_indices or phase_c_local_q:
+            self._pic_rope_phase_c(
+                q3, k3, v3, layer, forward_batch, rope_meta,
+                global_q_indices, o_buf,
+                hit_seam_q_info=hit_seam_q_info if is_recompute else None,
+                local_miss_q_indices=phase_c_local_q,
+            )
+
+        return o_buf.view(-1, num_q_heads * head_dim)
+
+    def _pic_rope_phase_a_kv_only(
+        self,
+        q3: torch.Tensor, k3: torch.Tensor, v3: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        rope_meta: List[Dict[str, object]],
+        local_q_indices: List[int],
+    ):
+        """Phase A degraded: stage miss-seg K/V into PUBLIC (pos=0 K, derotated)
+        and PRIVATE (real-pos K, as model produced). NO attention here.
+        miss-seg query attention is computed in Phase C alongside global Q.
+
+        Invariant after this function:
+          k_buffer[pub_slot]  = derotated K (pos=0, for caching as future hit-seg)
+          k_buffer[priv_slot] = real-pos K (for Phase C cross-seg attn)
+          v_buffer[pub_slot]  = v_buffer[priv_slot] = v_seg
+        """
+
+        device = q3.device
+        head_dim = layer.head_dim
+        rotary_dim = self._pic_rope_rotary_dim
+        is_neox = self._pic_rope_is_neox
+        cos_sin_cache = self._pic_rope_cos_sin_cache
+        token_to_kv_pool = self.token_to_kv_pool
+        layer_id = layer.layer_id
+        k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
+        v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
+
+        lq_cursor = 0
+        for req_idx, meta in enumerate(rope_meta):
+            local_miss = meta["local_miss"]
+            for (start, end, priv, pub) in local_miss:
+                seg_len = end - start
+                seg_q_idx = torch.tensor(
+                    local_q_indices[lq_cursor:lq_cursor + seg_len],
+                    dtype=torch.int64, device=device,
+                )
+                lq_cursor += seg_len
+
+                seg_positions = torch.full(
+                    (seg_len,), int(start), dtype=torch.int64, device=device,
+                )
+                cos_sin = cos_sin_cache.index_select(0, seg_positions)
+                cos, sin = cos_sin.chunk(2, dim=-1)
+
+                k_seg = k3.index_select(0, seg_q_idx)   # model already rope-applied → real pos
+                v_seg = v3.index_select(0, seg_q_idx)
+                k_zero = _derotate_with_partial(
+                    k_seg, cos, sin, rotary_dim, head_dim, is_neox, derotate_kv,
+                )
+
+                pub_dev = pub.to(device)
+                priv_dev = priv.to(device)
+                # PUBLIC: pos=0 K (cacheable, future hit-seg fills from here)
+                k_buffer[pub_dev] = k_zero
+                v_buffer[pub_dev] = v_seg
+                # PRIVATE: real-pos K (model output as-is, for Phase C cross-seg attn)
+                k_buffer[priv_dev] = k_seg
+                v_buffer[priv_dev] = v_seg
+
+    # ------------------------------------------------------------------
+    # Phase B: rerotate K @ pos=0 → real pos and write to private
+    # ------------------------------------------------------------------
+    def _pic_rope_phase_b(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        rope_meta: List[Dict[str, object]],
+    ):
+
+        device = forward_batch.input_ids.device
+        head_dim = layer.head_dim
+        rotary_dim = self._pic_rope_rotary_dim
+        is_neox = self._pic_rope_is_neox
+        token_to_kv_pool = self.token_to_kv_pool
+        layer_id = layer.layer_id
+        k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
+        v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
+
+        # Build batch-level cache once: concatenated src/dst indices and the
+        # per-row cos/sin tensors. Phase B rerotates K from "segment-anchored"
+        # form (k_raw[j]·R(j)) to real pos by multiplying by R(start) — the
+        # same R(start) for every token in the segment, so we expand `start`
+        # over seg_len rows. cos/sin are layer-invariant.
+        cache = getattr(self, "_pic_rope_phase_b_cache", None)
+        if cache is None:
+            cache = self._build_pic_rope_phase_b_cache(rope_meta, device)
+            self._pic_rope_phase_b_cache = cache
+        if cache is None:
+            return
+
+        src = cache["src"]
+        dst = cache["dst"]
+        cos = cache["cos"]
+        sin = cache["sin"]
+
+        k_zero = k_buffer.index_select(0, src)
+        v_zero = v_buffer.index_select(0, src)
+        k_real = _rerotate_with_partial(
+            k_zero, cos, sin, rotary_dim, head_dim, is_neox, rerotate_kv,
+        )
+        k_buffer[dst] = k_real
+        v_buffer[dst] = v_zero
+
+    def _build_pic_rope_phase_b_cache(
+        self,
+        rope_meta: List[Dict[str, object]],
+        device: torch.device,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Build batch-level Phase B cache: concat (src, dst, cos, sin) over
+        all hit segments. cos/sin use the segment's `start` repeated
+        seg_len times. Returns None if no segments need rerotation.
+
+        Miss segs are skipped: Phase A (`_pic_rope_phase_a_kv_only`) already
+        writes real-pos (model-output) K directly to priv. Re-running
+        rerotate(derotate(K_real)) here would round-trip through bf16 and
+        silently drift the priv slots that Phase C reads.
+        Hit segs are always covered: their entry pub is the canonical pos=0
+        cache K which has to be rerotated to real pos for cross-seg attn.
+        """
+        include_miss = False
+        cos_sin_cache = self._pic_rope_cos_sin_cache
+        src_chunks: List[torch.Tensor] = []
+        dst_chunks: List[torch.Tensor] = []
+        pos_list: List[int] = []  # one position per row, len = total_rows
+
+        for meta in rope_meta:
+            if include_miss:
+                for (start, end, priv, pub) in meta["local_miss"]:
+                    if priv.numel() == 0:
+                        continue
+                    seg_len = int(end - start)
+                    src_chunks.append(pub.to(device).to(torch.int64))
+                    dst_chunks.append(priv.to(device).to(torch.int64))
+                    pos_list.extend([int(start)] * seg_len)
+            for (start, end, priv, entry_pub) in meta["local_hit"]:
+                if priv.numel() == 0:
+                    continue
+                seg_len = int(end - start)
+                src_chunks.append(entry_pub.to(device).to(torch.int64))
+                dst_chunks.append(priv.to(device).to(torch.int64))
+                pos_list.extend([int(start)] * seg_len)
+
+        if not src_chunks:
+            return None
+
+        positions = torch.tensor(pos_list, dtype=torch.int64, device=device)
+        cos_sin = cos_sin_cache.index_select(0, positions)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        return {
+            "src": torch.cat(src_chunks, dim=0),
+            "dst": torch.cat(dst_chunks, dim=0),
+            "cos": cos,
+            "sin": sin,
+        }
+
+    # ------------------------------------------------------------------
+    # Phase C: global cross-seg attention at real pos
+    # ------------------------------------------------------------------
+    def _pic_rope_phase_c(
+        self,
+        q3: torch.Tensor,
+        k3: torch.Tensor,
+        v3: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        rope_meta: List[Dict[str, object]],
+        global_q_indices: List[int],
+        o_buf: torch.Tensor,
+        hit_seam_q_info: Optional[List[Tuple[int, int, Tuple[int, int], int]]] = None,
+        local_miss_q_indices: Optional[List[int]] = None,
+    ):
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+        device = q3.device
+        head_dim = layer.head_dim
+        token_to_kv_pool = self.token_to_kv_pool
+        layer_id = layer.layer_id
+        k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
+        v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
+
+        # Layer-invariant cache: built once per batch, reused by all 40 layers.
+        # Captures Q packing order, K/V destination slots, KV visibility indptrs,
+        # scatter index. Layer-variant work = K/V buffer scatter + wrapper.forward.
+        cache = getattr(self, "_pic_rope_phase_c_cache", None)
+        if cache is None:
+            cache = self._build_pic_rope_phase_c_cache(
+                rope_meta, global_q_indices, hit_seam_q_info, device,
+                local_miss_q_indices=local_miss_q_indices,
+            )
+            self._pic_rope_phase_c_cache = cache
+        if cache is None:
+            return  # nothing to do this batch
+
+        # Layer-variant work: scatter K/V into pool buffers at private slots.
+        if cache["kv_dst_slots"].numel() > 0:
+            k_buffer[cache["kv_dst_slots"]] = k3.index_select(0, cache["kv_src_qis"])
+            v_buffer[cache["kv_dst_slots"]] = v3.index_select(0, cache["kv_src_qis"])
+
+        q_packed = q3.index_select(0, cache["q_packed_src"])
+
+        if self._pic_workspace is None:
+            self._pic_workspace = torch.empty(
+                128 * 1024 * 1024, dtype=torch.uint8, device=device
+            )
+        if self._pic_rope_global_wrapper is None:
+            self._pic_rope_global_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                float_workspace_buffer=self._pic_workspace,
+            )
+
+        wrapper = self._pic_rope_global_wrapper
+        if not self._pic_rope_global_plan_ready:
+            wrapper.begin_forward(
+                qo_indptr=cache["qo_indptr"],
+                paged_kv_indptr=cache["kv_indptr"],
+                paged_kv_indices=cache["kv_indices"],
+                paged_kv_last_page_len=cache["kv_last_page_len"],
+                num_qo_heads=layer.tp_q_head_num,
+                num_kv_heads=layer.tp_k_head_num,
+                head_dim_qk=head_dim,
+                page_size=1,
+                causal=True,
+                q_data_type=q_packed.dtype,
+            )
+            self._pic_rope_global_plan_ready = True
+
+        kv_buf = token_to_kv_pool.get_kv_buffer(layer_id)
+        q_pos = forward_batch.positions
+        if q_pos is not None and q_pos.shape[0] == q3.shape[0]:
+            q_pos = q_pos.index_select(0, cache["q_packed_src"])
+        _dump_moti2_context_kv(
+            layer,
+            q_packed,
+            kv_buf,
+            cache["kv_indices"],
+            q_pos,
+            cache["qo_indptr"],
+            cache["kv_indptr"],
+            cache.get("kv_positions"),
+        )
+        o_packed = wrapper.forward(
+            q_packed,
+            kv_buf,
+            causal=True,
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+        )
+
+        o_buf.index_copy_(0, cache["scatter_idx"], o_packed)
+
+    def _build_pic_rope_phase_c_cache(
+        self,
+        rope_meta: List[Dict[str, object]],
+        global_q_indices: List[int],
+        hit_seam_q_info: Optional[List[Tuple[int, int, Tuple[int, int], int]]],
+        device: torch.device,
+        local_miss_q_indices: Optional[List[int]] = None,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Build layer-invariant Phase C metadata once per batch.
+
+        Returns dict with q_packed_src, kv_dst_slots, kv_src_qis, kv_indices,
+        qo_indptr, kv_indptr, kv_last_page_len, scatter_idx. None if no work.
+
+        local_miss_q_indices: miss-seg query attention is deferred from
+        Phase A to here. Each miss-seg Q row joins as its own
+        FlashInfer prefill segment (qo_len=1) with a causal KV slice = concat
+        of priv slots of all earlier-end segs of its req + the in-seg prefix
+        of its own seg (up to abs_pos). Priv slots are populated by Phase A
+        (miss → real-pos K from model) and Phase B (hit → rerotated real-pos
+        K from entry pub).
+        """
+        local_miss_q_indices = local_miss_q_indices or []
+        # Group hit-seam Q entries by req with abs_pos derived from rope_meta.
+        hit_seam_by_req: Dict[int, List[Tuple[int, int, Tuple[int, int], int]]] = {}
+        if hit_seam_q_info:
+            seam_idx = 0
+            for ri, meta in enumerate(rope_meta):
+                seam_info = meta.get("seam") if isinstance(meta, dict) else None
+                if seam_info is None:
+                    continue
+                hit_seam = seam_info.get("hit_seam", {})
+                for (s, e), sink_pos in hit_seam.items():
+                    for j, ap in enumerate(sink_pos):
+                        qi = hit_seam_q_info[seam_idx][0]
+                        hit_seam_by_req.setdefault(ri, []).append(
+                            (qi, ap, (s, e), j)
+                        )
+                        seam_idx += 1
+
+        q_packed_src: List[int] = []
+        seg_q_offsets: List[int] = [0]
+        kv_indices_chunks: List[torch.Tensor] = []
+        kv_pos_chunks: List[torch.Tensor] = []
+        seg_kv_offsets: List[int] = [0]
+        scatter_q_idx_all: List[int] = []
+        # K/V destination slots and source q indices (paired, scatter together).
+        kv_dst_slots_chunks: List[torch.Tensor] = []
+        kv_src_qis_list: List[int] = []
+        gq_cursor = 0
+
+        if not self._pic_is_bailing_linear_model():
+            # Bucket miss-seg Q by req for fast lookup.
+            miss_q_by_req: Dict[int, List[Tuple[int, int]]] = {}
+            for qi in local_miss_q_indices:
+                if qi not in self._pic_q_to_req_abs_dict:
+                    raise RuntimeError(
+                        f"PIC Phase C: miss Q {qi} not in q_to_req_abs map"
+                    )
+                ri, ap = self._pic_q_to_req_abs_dict[qi]
+                miss_q_by_req.setdefault(ri, []).append((ap, qi))
+
+            for req_idx, meta in enumerate(rope_meta):
+                global_info = meta["global"]
+                seam_for_req = hit_seam_by_req.get(req_idx, [])
+                miss_q_for_req = miss_q_by_req.get(req_idx, [])
+                if (
+                    global_info is None
+                    and not seam_for_req
+                    and not miss_q_for_req
+                ):
+                    continue
+
+                # Order hit+miss segs by abs start. Append global as the last
+                # seg in priv_tensors so per-Q seg lookup is unified.
+                all_segs_in_order: List[Tuple[int, int, torch.Tensor]] = []
+                for (s, e, priv, _pub) in meta["local_miss"]:
+                    all_segs_in_order.append((s, e, priv))
+                for (s, e, priv, _entry) in meta["local_hit"]:
+                    all_segs_in_order.append((s, e, priv))
+                all_segs_in_order.sort(key=lambda t: t[0])
+
+                # ---- K/V scatter scheduling (unchanged semantics) ----------
+                gq_slice: List[int] = []
+                gs = ge = None
+                gp = None
+                if global_info is not None:
+                    (gs, ge, gp) = global_info
+                    gseg_len = ge - gs
+                    gq_slice = global_q_indices[gq_cursor:gq_cursor + gseg_len]
+                    gq_cursor += gseg_len
+                    kv_dst_slots_chunks.append(gp.to(device).to(torch.int64))
+                    kv_src_qis_list.extend(gq_slice)
+
+                hit_priv = {
+                    (hs, he): p for (hs, he, p, _entry) in meta["local_hit"]
+                }
+                for (qi, ap, (s, e), _lofs) in seam_for_req:
+                    priv = hit_priv.get((s, e))
+                    if priv is None:
+                        continue
+                    slot_ofs = int(ap) - int(s)
+                    kv_dst_slots_chunks.append(
+                        priv.to(device).to(torch.int64)[slot_ofs:slot_ofs + 1]
+                    )
+                    kv_src_qis_list.append(qi)
+
+                # ---- Batched per-run Q planning (1 plan / 1 kernel) -------
+                # Group Qs into maximal abs_pos-consecutive runs within the
+                # same containing seg. Each run → one FlashInfer seg with
+                # qo_len = run_len, kv_len = all_priors_priv + own_priv[:last-s+1].
+                # FlashInfer causal=True suffix mask in this layout gives
+                # Q[i] visibility = priors + own_priv[:first-s+i+1] — exactly
+                # the causal prefix for the i-th run token. Correct equivalent
+                # of per-row planning, but seg count drops from O(tokens) to
+                # O(runs) ≈ O(segs/req).
+
+                # Per-req cached priv int32 tensors + bounds + cum lens.
+                priv_tensors: List[torch.Tensor] = []
+                priv_bounds: List[Tuple[int, int]] = []
+                for (s, e, priv) in all_segs_in_order:
+                    priv_tensors.append(priv.to(device).to(torch.int32))
+                    priv_bounds.append((s, e))
+                if global_info is not None:
+                    priv_tensors.append(gp.to(device).to(torch.int32))
+                    priv_bounds.append((gs, ge))
+                cum_lens: List[int] = [0]
+                for t in priv_tensors:
+                    cum_lens.append(cum_lens[-1] + int(t.numel()))
+
+                # Collect all Qs of this req, sorted by abs_pos.
+                all_qs: List[Tuple[int, int]] = []
+                if global_info is not None:
+                    for j, qi in enumerate(gq_slice):
+                        all_qs.append((gs + j, qi))
+                for (qi, ap, _rng, _lofs) in seam_for_req:
+                    all_qs.append((ap, qi))
+                for (ap, qi) in miss_q_for_req:
+                    all_qs.append((ap, qi))
+                all_qs.sort(key=lambda x: x[0])
+
+                # Walk Qs, emit one seg per consecutive run within same seg.
+                i = 0
+                while i < len(all_qs):
+                    ap0, qi0 = all_qs[i]
+                    k = None
+                    for kk, (s, e) in enumerate(priv_bounds):
+                        if s <= ap0 < e:
+                            k = kk
+                            break
+                    if k is None:
+                        raise RuntimeError(
+                            f"PIC Phase C: Q {qi0} abs_pos={ap0} not in any seg"
+                        )
+                    s_k, e_k = priv_bounds[k]
+                    run_qis = [qi0]
+                    expected_ap = ap0 + 1
+                    j = i + 1
+                    while j < len(all_qs):
+                        apj, qij = all_qs[j]
+                        if apj != expected_ap or apj >= e_k:
+                            break
+                        run_qis.append(qij)
+                        expected_ap += 1
+                        j += 1
+                    ap_last = expected_ap - 1
+                    own_prefix_len = ap_last - s_k + 1
+                    if cum_lens[k] > 0:
+                        kv_indices_chunks.append(
+                            torch.cat(priv_tensors[:k])
+                            if k > 1
+                            else priv_tensors[0]
+                        )
+                        kv_pos_chunks.append(
+                            torch.cat(
+                                [
+                                    torch.arange(
+                                        s, e, dtype=torch.int64, device=device
+                                    )
+                                    for s, e in priv_bounds[:k]
+                                ]
+                            )
+                        )
+                    kv_indices_chunks.append(priv_tensors[k][:own_prefix_len])
+                    kv_pos_chunks.append(
+                        torch.arange(
+                            s_k,
+                            s_k + own_prefix_len,
+                            dtype=torch.int64,
+                            device=device,
+                        )
+                    )
+                    total_kv = cum_lens[k] + own_prefix_len
+                    q_packed_src.extend(run_qis)
+                    scatter_q_idx_all.extend(run_qis)
+                    seg_q_offsets.append(seg_q_offsets[-1] + len(run_qis))
+                    seg_kv_offsets.append(seg_kv_offsets[-1] + total_kv)
+                    i = j
+
+            if not q_packed_src:
+                return None
+
+            num_segs = len(seg_q_offsets) - 1
+            return {
+                "q_packed_src": torch.tensor(
+                    q_packed_src, dtype=torch.int64, device=device
+                ),
+                "kv_dst_slots": torch.cat(kv_dst_slots_chunks, dim=0)
+                if kv_dst_slots_chunks
+                else torch.empty(0, dtype=torch.int64, device=device),
+                "kv_src_qis": torch.tensor(
+                    kv_src_qis_list, dtype=torch.int64, device=device
+                )
+                if kv_src_qis_list
+                else torch.empty(0, dtype=torch.int64, device=device),
+                "kv_indices": torch.cat(kv_indices_chunks, dim=0),
+                "kv_positions": torch.cat(kv_pos_chunks, dim=0),
+                "qo_indptr": torch.tensor(
+                    seg_q_offsets, dtype=torch.int32, device=device
+                ),
+                "kv_indptr": torch.tensor(
+                    seg_kv_offsets, dtype=torch.int32, device=device
+                ),
+                "kv_last_page_len": torch.ones(
+                    num_segs, dtype=torch.int32, device=device
+                ),
+                "scatter_idx": torch.tensor(
+                    scatter_q_idx_all, dtype=torch.int64, device=device
+                ),
+            }
+
+        def add_phase_c_segment(
+            q_abs_and_idx: List[Tuple[int, int]],
+            visible_slots: List[torch.Tensor],
+        ) -> None:
+            if not q_abs_and_idx:
+                return
+            q_abs_and_idx.sort(key=lambda x: x[0])
+            seg_qis = [qi for (_ap, qi) in q_abs_and_idx]
+            q_packed_src.extend(seg_qis)
+            scatter_q_idx_all.extend(seg_qis)
+            total_kv = 0
+            for slots in visible_slots:
+                if slots.numel() == 0:
+                    continue
+                kv_indices_chunks.append(slots.to(device).to(torch.int32))
+                total_kv += int(slots.numel())
+            if total_kv <= 0:
+                raise RuntimeError("PIC Phase C segment has Q but no visible KV")
+            seg_q_offsets.append(seg_q_offsets[-1] + len(seg_qis))
+            seg_kv_offsets.append(seg_kv_offsets[-1] + total_kv)
+
+        for req_idx, meta in enumerate(rope_meta):
+            global_info = meta["global"]
+            seam_for_req = hit_seam_by_req.get(req_idx, [])
+            if global_info is None and not seam_for_req:
+                continue
+
+            all_segs_in_order: List[Tuple[int, int, torch.Tensor]] = []
+            for (s, e, priv, _pub) in meta["local_miss"]:
+                all_segs_in_order.append((s, e, priv))
+            for (s, e, priv, _entry) in meta["local_hit"]:
+                all_segs_in_order.append((s, e, priv))
+            all_segs_in_order.sort(key=lambda t: t[0])
+
+            # Build hit-seg priv lookup and seam q-index lookup. Each seam
+            # window is planned as a separate FlashInfer segment whose Q tokens
+            # are the suffix of its visible KV. A single mixed segment
+            # (C1 seam + C3 seam + global) violates FlashInfer causal suffix
+            # semantics and lets early seam Q attend to future KV.
+            hit_priv = {(hs, he): p for (hs, he, p, _entry) in meta["local_hit"]}
+            seam_q_by_abs = {ap: qi for (qi, ap, _rng, _lofs) in seam_for_req}
+            seam_info = meta.get("seam") if isinstance(meta, dict) else None
+            if seam_info is not None:
+                hit_seam = seam_info.get("hit_seam", {}) or {}
+                for (s, e), sink_pos in hit_seam.items():
+                    priv = hit_priv.get((s, e))
+                    if priv is None:
+                        continue
+                    priv_dev = priv.to(device)
+                    if not sink_pos:
+                        continue
+                    q_entries = [
+                        (int(ap), seam_q_by_abs[int(ap)])
+                        for ap in sink_pos
+                        if int(ap) in seam_q_by_abs
+                    ]
+                    if not q_entries:
+                        continue
+                    # Write recomputed K/V for these Q tokens to their real
+                    # private slots. Slots are aligned to absolute position
+                    # within the hit segment.
+                    slot_offsets = torch.tensor(
+                        [int(ap) - int(s) for ap, _qi in q_entries],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    kv_dst_slots_chunks.append(
+                        priv_dev.to(torch.int64).index_select(0, slot_offsets)
+                    )
+                    kv_src_qis_list.extend([qi for _ap, qi in q_entries])
+
+                    last_ap = max(ap for ap, _qi in q_entries)
+                    local_end = int(last_ap) - int(s) + 1
+                    visible_slots: List[torch.Tensor] = []
+                    for ss, ee, seg_priv in all_segs_in_order:
+                        if ee <= s:
+                            visible_slots.append(seg_priv.to(device))
+                        elif ss == s and ee == e:
+                            visible_slots.append(seg_priv.to(device)[:local_end])
+                            break
+                    add_phase_c_segment(q_entries, visible_slots)
+
+            if global_info is not None:
+                (gs, ge, gp) = global_info
+                gseg_len = ge - gs
+                gq_slice = global_q_indices[gq_cursor:gq_cursor + gseg_len]
+                gq_cursor += gseg_len
+                q_entries = [(gs + j, qi) for j, qi in enumerate(gq_slice)]
+                # Schedule K/V write: dst = gp, src = gq_slice (real-pos aligned).
+                kv_dst_slots_chunks.append(gp.to(device).to(torch.int64))
+                kv_src_qis_list.extend(gq_slice)
+                visible_slots = [priv.to(device) for _s, _e, priv in all_segs_in_order]
+                visible_slots.append(gp.to(device))
+                add_phase_c_segment(q_entries, visible_slots)
+
+            # Miss-seg Q rows: each Q row → 1 FlashInfer
+            # prefill segment with causal KV slice over prior + own-prefix.
+            miss_q_for_req = sorted(
+                [
+                    (self._pic_q_to_req_abs_dict[qi][1], qi)
+                    for qi in (local_miss_q_indices or [])
+                    if self._pic_q_to_req_abs_dict.get(qi, (-1, -1))[0] == req_idx
+                ],
+                key=lambda x: x[0],
+            )
+            for (abs_pos, qi) in miss_q_for_req:
+                visible_slots_m: List[torch.Tensor] = []
+                for (s, e, priv) in all_segs_in_order:
+                    if e <= abs_pos + 1:
+                        visible_slots_m.append(priv.to(device))
+                    elif s <= abs_pos < e:
+                        local_end = abs_pos - s + 1
+                        visible_slots_m.append(priv.to(device)[:local_end])
+                        break
+                    else:
+                        break
+                add_phase_c_segment([(abs_pos, qi)], visible_slots_m)
+
+        if not q_packed_src:
+            return None
+
+        num_segs = len(seg_q_offsets) - 1
+        return {
+            "q_packed_src": torch.tensor(q_packed_src, dtype=torch.int64, device=device),
+            "kv_dst_slots": torch.cat(kv_dst_slots_chunks, dim=0)
+                if kv_dst_slots_chunks else torch.empty(0, dtype=torch.int64, device=device),
+            "kv_src_qis": torch.tensor(kv_src_qis_list, dtype=torch.int64, device=device)
+                if kv_src_qis_list else torch.empty(0, dtype=torch.int64, device=device),
+            "kv_indices": torch.cat(kv_indices_chunks, dim=0),
+            "qo_indptr": torch.tensor(seg_q_offsets, dtype=torch.int32, device=device),
+            "kv_indptr": torch.tensor(seg_kv_offsets, dtype=torch.int32, device=device),
+            "kv_last_page_len": torch.ones(num_segs, dtype=torch.int32, device=device),
+            "scatter_idx": torch.tensor(scatter_q_idx_all, dtype=torch.int64, device=device),
+        }
+
+    def _init_pic_rope_plans(self, forward_batch: ForwardBatch):
+        """Placeholder for parity with _init_pic_prefill_plan: rope plans are
+        built inside Phase A / Phase C (per-batch via begin_forward). We only
+        need to reset the lazy wrapper-ready flags here."""
+        self._pic_rope_local_plan_ready = False
+        self._pic_rope_global_plan_ready = False
+        self._pic_rope_phase_c_cache = None
+        self._pic_rope_phase_b_cache = None
+        self._pic_rope_cross_real_cache = None
+
+    def _init_pic_rope_cache(self):
+        """Lazily initialize rotary embedding cache for transition_rope mode.
+
+        Finds the rotary_emb on the model and stores cos_sin_cache, is_neox_style,
+        and rotary_dim for use by Phase A/B/C derotate/rerotate ops.
+        """
+        if self._model_runner is None:
+            logger.warning("_init_pic_rope_cache: no model_runner, cannot init rope cache")
+            return
+        model = self._model_runner.model
+        # Walk model to find rotary_emb. Common locations:
+        # model.model.layers[i].self_attn.rotary_emb (Qwen, Llama, etc.)
+        # model.model.rotary_emb (some architectures)
+        rotary_emb = None
+        rotary_source = None
+        if hasattr(model, "model"):
+            inner = model.model
+            if hasattr(inner, "rotary_emb"):
+                rotary_emb = inner.rotary_emb
+                rotary_source = "model.model.rotary_emb"
+            elif hasattr(inner, "layers"):
+                fallback = None
+                fallback_source = None
+                for idx, layer_module in enumerate(inner.layers):
+                    for attr in ("self_attn", "attention"):
+                        attn_holder = getattr(layer_module, attr, None)
+                        if attn_holder is None or not hasattr(attn_holder, "rotary_emb"):
+                            continue
+                        source = f"model.model.layers.{idx}.{attr}.rotary_emb"
+                        if fallback is None:
+                            fallback = attn_holder.rotary_emb
+                            fallback_source = source
+                        attn = getattr(attn_holder, "attn", None)
+                        layer_id = getattr(attn, "layer_id", None)
+                        if layer_id in self.full_attn_layers:
+                            rotary_emb = attn_holder.rotary_emb
+                            rotary_source = source
+                            break
+                    if rotary_emb is not None:
+                        break
+                if rotary_emb is None:
+                    rotary_emb = fallback
+                    rotary_source = fallback_source
+        if rotary_emb is None:
+            # Fallback: search all modules
+            for name, module in model.named_modules():
+                if hasattr(module, "cos_sin_cache") and hasattr(module, "is_neox_style"):
+                    rotary_emb = module
+                    rotary_source = name
+                    break
+        if rotary_emb is None:
+            logger.error("_init_pic_rope_cache: could not find rotary_emb on model")
+            return
+
+        self._pic_rope_cos_sin_cache = rotary_emb.cos_sin_cache
+        self._pic_rope_is_neox = rotary_emb.is_neox_style
+        self._pic_rope_rotary_dim = rotary_emb.rotary_dim
+        logger.info(
+            "PIC transition_rope: initialized rope cache from %s "
+            "(rotary_dim=%d, is_neox=%s, cache_len=%d, dtype=%s)",
+            rotary_source,
+            self._pic_rope_rotary_dim,
+            self._pic_rope_is_neox,
+            self._pic_rope_cos_sin_cache.shape[0],
+            self._pic_rope_cos_sin_cache.dtype,
+        )
+
+    def _init_pic_prefill_plan(self, forward_batch: ForwardBatch):
+        """Build FlashInfer prefill plan for PIC per-segment full-attn.
+
+        Called once per batch in init_forward_metadata. The wrapper + plan is
+        reused by all full-attn layers in _forward_extend_pic_full_attn.
+        """
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+        device = forward_batch.input_ids.device
+        pic_miss_segments = forward_batch.pic_miss_segments
+        batch_size = forward_batch.batch_size
+
+        seg_q_lens = []
+        seg_kv_lens = []
+        seg_req_indices = []
+
+        for req_idx in range(batch_size):
+            miss_segs = pic_miss_segments[req_idx]
+            for (start, end) in miss_segs:
+                seg_q_lens.append(end - start)
+                seg_kv_lens.append(end)
+                seg_req_indices.append(req_idx)
+
+            # Recompute mode adds seam tokens (sink from hit segments)
+            # to the q tensor. Include them as extra query segments so the
+            # FlashInfer plan covers all q rows.
+            rope_meta = getattr(forward_batch, "pic_rope_meta", None)
+            if rope_meta is not None and req_idx < len(rope_meta):
+                meta = rope_meta[req_idx]
+                seam_info = meta.get("seam") if isinstance(meta, dict) else None
+                if seam_info is not None:
+                    hit_seam = seam_info.get("hit_seam", {})
+                    total_seam = sum(len(sp) for sp in hit_seam.values())
+                    if total_seam > 0:
+                        # Find the max KV length for this request's miss segs
+                        max_kv = miss_segs[-1][1] if miss_segs else 0
+                        seg_q_lens.append(total_seam)
+                        seg_kv_lens.append(max_kv)
+                        seg_req_indices.append(req_idx)
+
+        num_segs = len(seg_q_lens)
+        if num_segs == 0:
+            self._pic_has_plan = False
+            return
+
+        qo_indptr = torch.zeros(num_segs + 1, dtype=torch.int32, device=device)
+        for i, ql in enumerate(seg_q_lens):
+            qo_indptr[i + 1] = qo_indptr[i] + ql
+
+        req_to_token = self.req_to_token_pool.req_to_token
+        req_pool_indices = forward_batch.req_pool_indices
+
+        kv_indptr = torch.zeros(num_segs + 1, dtype=torch.int32, device=device)
+        kv_indices_list = []
+        kv_positions_list = []
+        for seg_i in range(num_segs):
+            req_idx = seg_req_indices[seg_i]
+            kv_len = seg_kv_lens[seg_i]
+            req_pool_idx = req_pool_indices[req_idx]
+            slots = req_to_token[req_pool_idx, :kv_len]
+            kv_indices_list.append(slots)
+            kv_positions_list.append(
+                torch.arange(kv_len, dtype=torch.int64, device=device)
+            )
+            kv_indptr[seg_i + 1] = kv_indptr[seg_i] + kv_len
+
+        kv_indices = torch.cat(kv_indices_list).to(torch.int32)
+        kv_positions = torch.cat(kv_positions_list).to(torch.int64)
+        kv_last_page_len = torch.ones(num_segs, dtype=torch.int32, device=device)
+
+        if self._pic_workspace is None:
+            self._pic_workspace = torch.empty(
+                128 * 1024 * 1024, dtype=torch.uint8, device=device
+            )
+
+        # T1: construct wrapper once, reuse across batches. Recreating per
+        # batch was the OOM root cause — each rebuild left the prior wrapper's
+        # internal FlashInfer state-tensors to be reclaimed asynchronously
+        # by Python GC, fragmenting the caching allocator until small allocs
+        # could not be satisfied. wrapper.begin_forward (called below in
+        # _forward_extend_pic_full_attn) re-plans on the same instance.
+        if self._pic_prefill_wrapper is None:
+            self._pic_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                float_workspace_buffer=self._pic_workspace,
+            )
+        self._pic_has_plan = True
+        self._pic_plan_ready = False
+        self._pic_qo_indptr = qo_indptr
+        self._pic_kv_indptr = kv_indptr
+        self._pic_kv_indices = kv_indices
+        self._pic_kv_positions = kv_positions
+        self._pic_kv_last_page_len = kv_last_page_len
+
+    def _forward_extend_pic_full_attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        """PIC full-attn: use pre-built FlashInfer plan from init_forward_metadata.
+
+        begin_forward is called once in _init_pic_prefill_plan; each layer
+        only calls wrapper.forward (the heavy GPU kernel) without re-planning.
+        """
+        # FlashInfer SM90 only supports head_dim in {64, 128, 256}. For MLA
+        # (head_dim=192) or other unsupported dims, fall back to the standard
+        # extend path which handles causal attention correctly via the model's
+        # native attention backend (fa3/triton).
+        _FLASHINFER_SUPPORTED_DIMS = {64, 128, 256}
+        if layer.head_dim not in _FLASHINFER_SUPPORTED_DIMS:
+            return self._forward_extend_pic_full_attn_native(
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+            )
+
+        cache_loc = forward_batch.out_cache_loc
+        if k is not None and v is not None and save_kv_cache:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+            )
+
+        if not self._pic_has_plan:
+            return q.new_zeros(0, layer.tp_q_head_num * layer.head_dim)
+
+        wrapper = self._pic_prefill_wrapper
+        if wrapper is None:
+            return q.new_zeros(0, layer.tp_q_head_num * layer.head_dim)
+
+        if not self._pic_plan_ready:
+            wrapper.begin_forward(
+                qo_indptr=self._pic_qo_indptr,
+                paged_kv_indptr=self._pic_kv_indptr,
+                paged_kv_indices=self._pic_kv_indices,
+                paged_kv_last_page_len=self._pic_kv_last_page_len,
+                num_qo_heads=layer.tp_q_head_num,
+                num_kv_heads=layer.tp_k_head_num,
+                head_dim_qk=layer.head_dim,
+                page_size=1,
+                causal=True,
+                q_data_type=q.dtype,
+            )
+            self._pic_plan_ready = True
+
+        kv_buf = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        _dump_moti2_context_kv(
+            layer,
+            q,
+            kv_buf,
+            self._pic_kv_indices,
+            forward_batch.positions,
+            self._pic_qo_indptr,
+            self._pic_kv_indptr,
+            self._pic_kv_positions,
+        )
+        o = wrapper.forward(
+            q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            kv_buf,
+            causal=True,
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+        )
+
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _forward_extend_pic_full_attn_native(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        """Fallback for PIC full-attn when FlashInfer doesn't support the head_dim.
+
+        Delegates to the standard full-attn extend backend (fa3/triton) which
+        handles causal attention correctly via the model's native path. For MLA
+        models this goes through absorb+decompress → fa3 paged attention.
+        """
+        return self.full_attn_backend.forward_extend(
+            q, k, v, layer, forward_batch, save_kv_cache, **kwargs
         )
 
     def forward(

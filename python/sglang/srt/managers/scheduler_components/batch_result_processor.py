@@ -175,6 +175,14 @@ class SchedulerBatchResultProcessor:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def _pic_push_if_scatter(self, req: Req):
+        # ponytail: 同步 push（urllib 阻塞）；scatter 子请求 max_tokens=1，
+        # 单段开销可接受。local import 避免 scatter_xfer ↔ scheduler 循环依赖。
+        if getattr(req, "pic_scatter_meta", None):
+            from sglang.srt.pic.scatter_xfer import maybe_push_after_prefill
+
+            maybe_push_after_prefill(req, self)
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -240,6 +248,7 @@ class SchedulerBatchResultProcessor:
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
+                        self._pic_push_if_scatter(req)
                         if self.server_args.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
@@ -324,6 +333,7 @@ class SchedulerBatchResultProcessor:
                         req.time_stats.set_completion_time()
                     else:
                         maybe_cache_unfinished_req(req, self.tree_cache)
+                        self._pic_push_if_scatter(req)
                 else:
                     # being chunked reqs' prefill is not finished
                     req.inflight_middle_chunks -= 1
@@ -906,6 +916,9 @@ class SchedulerBatchResultProcessor:
             return
 
         req.mamba_last_track_seqlen = track_seqlen
+        # PIC: record the ping-pong buffer holding the just-tracked state
+        # (captured before any swap below).
+        req.mamba_last_track_buffer_idx = req.mamba_next_track_idx
         if lazy:
             self.mamba_lazy_post_decode_at_boundary(req, batch)
         else:

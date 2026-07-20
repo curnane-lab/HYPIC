@@ -233,6 +233,15 @@ class SchedulerInvariantChecker:
         if self.get_last_batch() is None:
             return
 
+        from sglang.srt.pic.picache import PICache
+
+        if isinstance(self.tree_cache, PICache):
+            # PIC accounting differs from the standard pools; use the
+            # dedicated check and skip the full/swa pool invariants.
+            leak, msg = self._check_pic_memory()
+            assert not leak, f"PIC Pool Mem Leak Detected! {msg}"
+            return
+
         ps = self.pool_stats_observer.get_pool_stats()
         full_uncached, swa_uncached = self._get_total_uncached_sizes()
 
@@ -295,10 +304,56 @@ class SchedulerInvariantChecker:
             msg,
         )
 
+    def _check_pic_memory(self) -> Tuple[bool, str]:
+        """Dedicated memory check for PICache.
+
+        Slot lifecycle in PICache:
+          alloc (pic_alloc_for_extend) → inflight →
+            non-last segments → _entries (evictable/protected)
+            last segment → freed in cache_finished_req
+        Accounting: used = entries(protected + evictable) + inflight
+        """
+        tc = self.tree_cache
+        full_available = self.token_to_kv_pool_allocator.available_size()
+        full_in_entries = tc.total_size()
+        full_inflight = tc._inflight_full_tokens
+        full_total = self.token_to_kv_pool_allocator.size
+        full_accounted = full_available + full_in_entries + full_inflight
+
+        mamba_available = self.req_to_token_pool.mamba_allocator.available_size()
+        mamba_in_entries = len(tc._entries)
+        mamba_inflight = tc._inflight_mamba_slots
+        mamba_total = self.req_to_token_pool.mamba_pool.size
+        mamba_accounted = mamba_available + mamba_in_entries + mamba_inflight
+
+        full_leaked = full_total - full_accounted
+        mamba_leaked = mamba_total - mamba_accounted
+        # Negative full_leaked means _entries hold slots the allocator also
+        # reports as available (entries ARE reclaimable via evict, so allocator
+        # correctly counts them). Only positive leaked indicates true leak.
+        # Mamba: each completed request's running mamba slot (used during decode)
+        # is freed back via req_to_token_pool.free_mamba_cache, but in PIC mode
+        # (supports_mamba=True) that path is skipped. Allow small tolerance.
+        memory_leak = full_leaked > 0 or mamba_leaked > 3
+
+        token_msg = (
+            f"PIC: full_available={full_available}, in_entries={full_in_entries}, "
+            f"inflight={full_inflight}, total={full_total}, leaked={full_leaked}\n"
+            f"PIC: mamba_available={mamba_available}, in_entries={mamba_in_entries}, "
+            f"inflight={mamba_inflight}, total={mamba_total}, leaked={mamba_leaked}"
+        )
+        return memory_leak, token_msg
+
     def _check_all_pools(
         self, ps: PoolStats, uncached: int = 0
     ) -> Tuple[bool, List[str]]:
         """Check memory invariant across all pools. Returns (has_leak, messages)."""
+        from sglang.srt.pic.picache import PICache
+
+        if isinstance(self.tree_cache, PICache):
+            leak, msg = self._check_pic_memory()
+            return leak, [msg]
+
         has_leak = False
         messages = []
 

@@ -301,6 +301,12 @@ class MambaPool:
     class State:
         conv: List[torch.Tensor]
         temporal: torch.Tensor
+        transition: Optional[torch.Tensor] = None
+        # PIC conv tail cache (any pic_mode): last (K-1) raw mixed_qkv input
+        # tokens of each cached segment, indexed by mamba slot. Loaded into
+        # conv before causal_conv1d_fn on miss-segment forward to provide the
+        # conv history that the preceding hit segment would have left.
+        conv_tails: Optional[List[torch.Tensor]] = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -308,7 +314,9 @@ class MambaPool:
             for f in fields(self):
                 name = f.name
                 v = getattr(self, name)
-                if name in ("conv", "intermediate_conv_window"):
+                if v is None:
+                    kwargs[name] = None
+                elif name in ("conv", "conv_tails", "intermediate_conv_window"):
                     kwargs[name] = [conv[layer] for conv in v]
                 else:
                     kwargs[name] = v[layer]
@@ -316,10 +324,12 @@ class MambaPool:
             return type(self)(**kwargs)
 
         def mem_usage_bytes(self):
-            return sum(
-                get_tensor_size_bytes(getattr(self, f.name))
-                for f in dataclasses.fields(self)
-            )
+            total = 0
+            for f in dataclasses.fields(self):
+                v = getattr(self, f.name)
+                if v is not None:
+                    total += get_tensor_size_bytes(v)
+            return total
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
@@ -337,6 +347,7 @@ class MambaPool:
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
+        pic_mode: Optional[str] = None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -346,6 +357,7 @@ class MambaPool:
             enable=enable_memory_saver
         )
         num_mamba_layers = len(mamba_layer_ids)
+        self.pic_mode = pic_mode
 
         self.size = size
         self.device = device
@@ -392,6 +404,36 @@ class MambaPool:
                 dtype=ssm_dtype,
                 device=device,
             )
+            # PIC transition buffer: [num_mamba_layers, pool_size+1, H_v, K, K]
+            # H_v = temporal_state_shape[0], K = temporal_state_shape[2]
+            # T is per-value-head (each value head has its own w but shares k
+            # with its GQA group, so T_{v_h} = exp(g[v_h//gs])*I - w[v_h]^T @ k[v_h//gs])
+            transition_state = None
+            from sglang.srt.pic.policy import POLICIES, PICCompose
+
+            if pic_mode is not None and POLICIES[pic_mode].compose is PICCompose.TRANSITION:
+                h_v = temporal_state_shape[0]
+                k_dim = temporal_state_shape[2]
+                transition_state = torch.zeros(
+                    size=(num_mamba_layers, size + 1, h_v, k_dim, k_dim),
+                    dtype=ssm_dtype,
+                    device=device,
+                )
+
+            # PIC conv_tails: per-segment conv history (last K-1 raw mixed_qkv
+            # tokens) so a miss segment forward can prepend the conv state of
+            # its preceding hit/miss segment. Mirrors conv_state shape exactly.
+            conv_tails_state = None
+            if pic_mode is not None:
+                conv_tails_state = [
+                    torch.zeros(
+                        size=(num_mamba_layers, size + 1) + conv_shape,
+                        dtype=conv_dtype,
+                        device=device,
+                    )
+                    for conv_shape in conv_state_shape
+                ]
+
             if speculative_num_draft_tokens is not None:
                 if _is_npu:
                     temporal_state = temporal_state.transpose(-1, -2)
@@ -497,26 +539,41 @@ class MambaPool:
                 self.mamba_cache = self.SpeculativeState(
                     conv=conv_state,
                     temporal=temporal_state,
+                    transition=transition_state,
+                    conv_tails=conv_tails_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
                     intermediate_conv_window=intermediate_conv_window_cache,
                 )
+                transition_info = ""
+                if transition_state is not None:
+                    transition_info = f"transition_state size: {get_tensor_size_bytes(transition_state) / GB:.2f}GB "
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                    f"{transition_info}"
                     f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
                     # Report the deduplicated PHYSICAL conv-window buffers (the view
                     # over-reports its logical, un-deduplicated size).
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
                 )
             else:
-                self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
+                self.mamba_cache = self.State(
+                    conv=conv_state,
+                    temporal=temporal_state,
+                    transition=transition_state,
+                    conv_tails=conv_tails_state,
+                )
+                transition_info = ""
+                if transition_state is not None:
+                    transition_info = f"transition_state size: {get_tensor_size_bytes(transition_state) / GB:.2f}GB "
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                    f"{transition_info}"
                 )
             mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
             if isinstance(self.mamba_cache, self.SpeculativeState):
@@ -540,6 +597,18 @@ class MambaPool:
     def mamba2_layer_cache(self, layer_id: int):
         return self.mamba_cache.at_layer_idx(layer_id)
 
+    def mamba2_transition_cache(self, layer_id: int) -> Optional[torch.Tensor]:
+        """Return the transition buffer for a given layer, or None if not allocated."""
+        if self.mamba_cache.transition is None:
+            return None
+        return self.mamba_cache.transition[layer_id]
+
+    def mamba2_conv_tails_cache(self, layer_id: int) -> Optional[List[torch.Tensor]]:
+        """Return the conv_tails buffer for a given layer, or None if not allocated."""
+        if self.mamba_cache.conv_tails is None:
+            return None
+        return [t[layer_id] for t in self.mamba_cache.conv_tails]
+
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
         need_size = len(indices)
@@ -554,6 +623,19 @@ class MambaPool:
             t.shape[0], need_size, *t.shape[2:]
         )
         t[:, indices] = z
+        if self.mamba_cache.transition is not None:
+            t = self.mamba_cache.transition
+            z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
+                t.shape[0], need_size, *t.shape[2:]
+            )
+            t[:, indices] = z
+        if self.mamba_cache.conv_tails is not None:
+            for i in range(len(self.mamba_cache.conv_tails)):
+                t = self.mamba_cache.conv_tails[i]
+                z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
+                    t.shape[0], need_size, *t.shape[2:]
+                )
+                t[:, indices] = z
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         for i in range(len(self.mamba_cache.conv)):
@@ -563,6 +645,15 @@ class MambaPool:
         self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
             :, src_indices
         ]
+        if self.mamba_cache.transition is not None:
+            self.mamba_cache.transition[:, dst_indices] = self.mamba_cache.transition[
+                :, src_indices
+            ]
+        if self.mamba_cache.conv_tails is not None:
+            for i in range(len(self.mamba_cache.conv_tails)):
+                self.mamba_cache.conv_tails[i][:, dst_indices] = (
+                    self.mamba_cache.conv_tails[i][:, src_indices]
+                )
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -599,6 +690,8 @@ class MambaPool:
             if field in ("intermediate_ssm", "intermediate_conv_window"):
                 continue
             value = getattr(self.mamba_cache, field)
+            if value is None:
+                continue
             if isinstance(value, list):
                 state_tensors.extend(value)
             else:
@@ -628,6 +721,8 @@ class MambaPool:
         state_tensors = []
         for field in vars(self.mamba_cache):
             value = getattr(self.mamba_cache, field)
+            if value is None:
+                continue
             if isinstance(value, list):
                 state_tensors.extend(value)
             else:
@@ -663,6 +758,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_eagle_topk: Optional[int] = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
+        pic_mode: Optional[str] = None,
     ):
         super().__init__(
             size=size,
@@ -686,6 +782,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            pic_mode=pic_mode,
         )
 
     def _init_mamba_pool(
@@ -698,6 +795,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
         speculative_eagle_topk: Optional[int] = None,
+        pic_mode: Optional[str] = None,
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -708,6 +806,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            pic_mode=pic_mode,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
@@ -803,6 +902,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def get_state_dim_per_tensor(self):
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def mamba2_conv_tails_cache(self, layer_id: int) -> Optional[List[torch.Tensor]]:
+        """Return the per-layer conv_tails buffer (PIC), or None if disabled."""
+        if self.mamba_pool.mamba_cache.conv_tails is None:
+            return None
+        assert layer_id in self.mamba_map
+        return self.mamba_pool.mamba2_conv_tails_cache(self.mamba_map[layer_id])
 
     def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
         if self.mamba_ping_pong_track_buffer_size == 2:

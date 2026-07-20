@@ -450,6 +450,16 @@ def alloc_for_extend(
         req_pool_indices_device: request pool indices as a device tensor
         req_pool_indices_cpu: request pool indices as a CPU tensor (host mirror)
     """
+    # PIC dispatch: PICache has a fundamentally different alloc shape
+    # (per-segment hit/miss writes) and does not share the prefix/extend
+    # contiguous-write path below.
+    from sglang.srt.pic.picache import PICache
+
+    if isinstance(batch.tree_cache, PICache):
+        from sglang.srt.pic.pic_alloc import pic_alloc_for_extend
+
+        return pic_alloc_for_extend(batch)
+
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 

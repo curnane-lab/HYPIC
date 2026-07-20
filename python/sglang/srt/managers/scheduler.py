@@ -109,6 +109,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     FreezeGCReq,
     GetInternalStateReq,
+    PicScatterHandleReq,
     GetInternalStateReqOutput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
@@ -1338,6 +1339,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
+                (PicScatterHandleReq, self.handle_pic_scatter_handle),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -1514,6 +1516,8 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            self._pic_drain()
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1554,6 +1558,7 @@ class Scheduler(
                 continue
 
             self._apply_war_barrier()
+            self._pic_drain()
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -2057,10 +2062,34 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            # PIC: propagate per-request segment ranges from io_struct to Req.
+            # See qianyou/2026-05-28-pic-sglang-design.md §5.3.
+            if getattr(recv_req, "pic_segments", None) is not None:
+                req.pic_segments = recv_req.pic_segments
+            elif self.server_args.pic_enable and req.origin_input_ids:
+                # Requests that bypass PIC tokenization (input_ids-only paths,
+                # warmup, multimodal) still flow through a PIC-mode batch and
+                # must carry pic_segments — otherwise pic_alloc_for_extend
+                # allocates zero KV slots and the full-attn forward
+                # set_kv_buffer fails with a shape mismatch (k.shape[0]=N vs
+                # cache_loc.shape[0]=0). Default to one full-prompt miss
+                # segment so the standard single-seg PIC path is taken.
+                req.pic_segments = [(0, len(req.origin_input_ids))]
+
+            # PIC distributed-scatter: propagate scatter/combine routing fields.
+            req.pic_scatter_single_seg = getattr(
+                recv_req, "pic_scatter_single_seg", False
+            )
+            req.pic_scatter_meta = getattr(recv_req, "pic_scatter_meta", None)
+            req.pic_combine = getattr(recv_req, "pic_combine", None)
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
+                # ponytail: PIC scatter sub-requests do local prefill (no PD),
+                # so they legitimately carry no bootstrap room — skip the check.
                 if (
                     recv_req.bootstrap_room is None
+                    and not req.pic_scatter_single_seg
                     and self.transfer_backend != TransferBackend.FAKE
                 ):
                     error_msg = (
@@ -2255,9 +2284,111 @@ class Scheduler(
                     prefix_keys,
                 )
 
+    def _try_release_combines(self):
+        # PIC Scatter: delegate to scatter_xfer; called by commit-inject and
+        # local-scatter when a segment arrives, to unpark ready combine reqs.
+        from sglang.srt.pic.scatter_xfer import _try_release_combines
+
+        _try_release_combines(self)
+
+    def _pic_drain(self):
+        # PIC Scatter: every-tick hook.
+        #  - try_push_pending: worker side — fire any scatter seg whose combine
+        #    dst handle has now arrived (non-blocking).
+        #  - drain_writes: worker side — reap fired WRITEs (release source pin
+        #    on completion), so seg i+1 prefill overlaps seg i WRITE.
+        #  - drain_injects: combine side — poll notifs + inject landed segments.
+        # All no-op (immediate return) when there is nothing pending.
+        from sglang.srt.pic.scatter_xfer import (
+            drain_injects,
+            drain_writes,
+            try_push_pending,
+        )
+
+        try_push_pending(self)
+        drain_writes(self)
+        drain_injects(self)
+
+        hit_retire = getattr(self, "_pic_hit_retire", None)
+        if hit_retire:
+            from sglang.srt.pic.scatter_xfer import pic_scatter_retire
+
+            self._pic_hit_retire = []
+            for req, seg_hash in hit_retire:
+                try:
+                    pic_scatter_retire(self, req, seg_hash, recomputed=False)
+                except Exception as e:
+                    logger.warning("pic hit-retire failed rid=%s: %s", req.rid, e)
+
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        # PIC Scatter: 单段子请求做普通本地 prefill，绕过 PD bootstrap（不发真 decode）。
+        # ponytail: scatter 子请求与原生 PD 请求互斥（前者带 single_seg），不影响后者路由。
+        if getattr(req, "pic_scatter_single_seg", False):
+            # PIC scatter: if this segment is already cached locally, skip the
+            # prefill forward entirely — pin the entry and stash for tick-driven
+            # retire (transfer cached state to combine). Restores cross-request
+            # chunk reuse (see qianyou/2026-07-16-pic-scatter-segment-cache-hit).
+            from sglang.srt.pic.segmenter import segment_hash
+
+            seg_hash = segment_hash(list(req.origin_input_ids))
+            entry = self.tree_cache._entries.get(seg_hash)
+            if entry is not None:
+                entry.lock_ref += 1  # hit-hold: protect until tick-driven retire
+                if not hasattr(self, "_pic_hit_retire"):
+                    self._pic_hit_retire = []
+                self._pic_hit_retire.append((req, seg_hash))
+                return
+            self.waiting_queue.append(req)
+            return
+        # PIC Scatter: combine 请求门控——等所有 scattered 段到达 PICache 再入原生 PD。
+        # ponytail: 门控键=全 scattered 段在 PICache；Q 段不 gate（combine forward 现 prefill）。
+        # ONLY the prefill (combine) worker gates; the decode worker receives the same
+        # body (with pic_combine) but must run the plain PD-decode role, not gate.
+        if (
+            getattr(req, "pic_combine", None) is not None
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+        ):
+            from sglang.srt.pic.segmenter import segment_hash
+
+            # Scattered segments = all but the last (Q). Use the engine's own
+            # pic_segments so gating never depends on the router's positional
+            # seg_index (which may disagree on empty-segment handling).
+            # ponytail: Q is always the last segment.
+            gated = []
+            if req.pic_segments and len(req.pic_segments) >= 2:
+                for s, t in req.pic_segments[:-1]:
+                    gated.append(segment_hash(req.origin_input_ids[s:t]))
+            req._pic_combine_hashes = gated
+            req.is_pic_combine = True
+            logger.info(
+                "PIC combine gating: rid=%s n_seg=%s gated=%s present=%s t=%.1f",
+                req.rid,
+                len(req.pic_segments) if req.pic_segments else 0,
+                [h.hex()[:12] for h in gated],
+                [h in self.tree_cache._entries for h in gated],
+                time.time() * 1000,
+            )
+            # PIC Scatter optA Task 1: batch-prealloc dst slots for every
+            # scattered seg and push handles to workers before self forward.
+            # (Even if all-present and not parked, harmless — failures swallowed.)
+            from sglang.srt.pic.scatter_xfer import prealloc_and_push_handles
+
+            prealloc_and_push_handles(self, req)
+            if not all(h in self.tree_cache._entries for h in gated):
+                if not hasattr(self, "_pic_combine_parked"):
+                    self._pic_combine_parked = []
+                self._pic_combine_parked.append(
+                    {
+                        "req": req,
+                        "hashes": gated,
+                        "deadline": time.monotonic()
+                        + self.server_args.pic_scatter_timeout_s,
+                    }
+                )
+                return
+            # all present → fall through to normal enqueue (native PD prefill).
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
@@ -2759,6 +2890,23 @@ class Scheduler(
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
+
+        # PIC Scatter ②: ready combine = highest priority. Combines only reach
+        # waiting_queue after all their scattered segments landed (parked until
+        # then), so any is_pic_combine req here is ready. Sort them ahead of
+        # scatter segment prefills so they run this batch, drain their dst mamba
+        # slots + hand KV to decode ASAP (fast turnover at the fixed router cap).
+        # Segments backfill with the remaining prefill budget. Env-gated for A/B.
+        if getattr(self, "_pic_combine_priority", None) is None:
+            self._pic_combine_priority = (
+                os.environ.get("PIC_COMBINE_PRIORITY", "1") == "1"
+            )
+        if self._pic_combine_priority and any(
+            getattr(r, "is_pic_combine", False) for r in self.waiting_queue
+        ):
+            from sglang.srt.pic.scatter_xfer import partition_combine_first
+
+            partition_combine_first(self.waiting_queue)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -3436,6 +3584,21 @@ class Scheduler(
             )
         return self.external_corpus_manager.list(recv_req)
 
+    def handle_pic_scatter_handle(
+        self, recv_req: PicScatterHandleReq
+    ) -> None:
+        # Worker side (scatter opt A): stash the dst handle combine pushed so
+        # maybe_push_after_prefill / try_push_pending can RDMA WRITE directly.
+        # Fire-and-forget: combine's POST does not await a response (see
+        # tokenizer pic_scatter_handle), so return None → no dangling output.
+        if not hasattr(self, "_pic_scatter_handles"):
+            self._pic_scatter_handles = {}
+        self._pic_scatter_handles[(recv_req.room, recv_req.seg_index)] = recv_req
+        from sglang.srt.pic.scatter_xfer import _perf
+
+        _perf("handle_recv", recv_req.room, seg=recv_req.seg_index)
+        return None
+
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:
             self.tree_cache.clear_storage_backend()
@@ -3448,6 +3611,9 @@ class Scheduler(
 
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        # ponytail: idle tick drives combine timeout when no arrival event fires.
+        if getattr(self, "_pic_combine_parked", None):
+            self._try_release_combines()
         if not self.is_fully_idle():
             return
 

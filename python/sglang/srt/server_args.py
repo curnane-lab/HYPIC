@@ -1860,6 +1860,36 @@ class ServerArgs:
         "Path to the LMCache YAML configuration file",
     ] = None
 
+    # PIC (Position-Independent Cache) — see qianyou/2026-05-28-pic-sglang-design.md
+    pic_enable: A[
+        bool,
+        "Enable Position-Independent Cache (PIC). See qianyou/2026-05-28-pic-sglang-design.md.",
+    ] = False
+    pic_separator_str: A[
+        str,
+        "Separator string used to split prompts into PIC segments.",
+    ] = "<<PIC_SEP>>"
+    pic_mode: A[
+        str,
+        Arg(
+            help="PIC composition mode. Only 'addition' is implemented in v1.",
+            choices=[
+                "addition",
+                "transition",
+                "transition_rope",
+                "transition_rope_recompute",
+            ],
+        ),
+    ] = "addition"
+    pic_segment_min_tokens: A[
+        int,
+        "Minimum token length for a segment to be cached. -1 = cache all segments.",
+    ] = -1  # -1 = cache all segments regardless of size
+    pic_scatter_timeout_s: A[
+        float,
+        "Seconds a combine request waits for all scattered segments before abort.",
+    ] = 600.0  # combine waits this long (10min) for scattered segs; large so warmup-congested late segs drain instead of spuriously aborting (which orphans the paired decode req -> deadlock). Still frees slots on true worker loss.
+
     # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism
     # -------------------------------------------------------------------------
@@ -2485,6 +2515,10 @@ class ServerArgs:
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
             return
+
+        # Validate PIC constraints early (before any model-loading logic), so that
+        # mis-configured pic_enable=True fails fast with a clear error.
+        self.check_pic_constraints()
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
@@ -6626,6 +6660,69 @@ class ServerArgs:
             ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {self.page_size=}"
             self._mamba_cache_chunk_size = max(chunk_size, self.page_size)
         return self._mamba_cache_chunk_size
+
+    def check_pic_constraints(self):
+        """Hard assertions and warnings for PIC v1 (see qianyou/2026-05-28-pic-sglang-design.md §4.1)."""
+        if not self.pic_enable:
+            return
+        # Heuristic model-arch gate. The authoritative arch check lives in the
+        # scheduler assembly (which has access to the resolved HF config).
+        # Here we only check known model families by path substring.
+        _PIC_MODEL_PATTERNS = ("Qwen3.5", "Qwen3_5", "Kimi", "kimi", "Ring", "Bailing", "bailing")
+        if not any(p in self.model_path for p in _PIC_MODEL_PATTERNS):
+            import logging
+            logging.getLogger(__name__).warning(
+                "PIC heuristic gate: model_path '%s' does not match known PIC-capable "
+                "families %s. Authoritative check is in scheduler assembly.",
+                self.model_path, _PIC_MODEL_PATTERNS,
+            )
+        from sglang.srt.pic.policy import POLICIES, PICCompose
+
+        assert self.pic_mode in POLICIES, (
+            f"pic_mode must be a known enum, got {self.pic_mode!r}"
+        )
+        # transition/transition_rope[_recompute] require Triton linear-attn backend for
+        # numerical consistency between state (S_i) and transition matrix (T_i) computation.
+        # Both prefill and decode must use the same backend to avoid precision mismatch.
+        if POLICIES[self.pic_mode].compose is PICCompose.TRANSITION:
+            if self.linear_attn_prefill_backend not in (None, "triton"):
+                logger.warning(
+                    "PIC %s mode requires triton linear-attn backend; "
+                    "overriding prefill %r → 'triton'", self.pic_mode, self.linear_attn_prefill_backend,
+                )
+            if self.linear_attn_decode_backend not in (None, "triton"):
+                logger.warning(
+                    "PIC %s mode requires triton linear-attn backend; "
+                    "overriding decode %r → 'triton'", self.pic_mode, self.linear_attn_decode_backend,
+                )
+            self.linear_attn_prefill_backend = "triton"
+            self.linear_attn_decode_backend = "triton"
+        # Check chunked_prefill_size before page_size: page_size defaults to None
+        # and is normalized later in _handle_page_size (which runs after this early
+        # call). chunked_prefill_size is the user-facing knob most likely to clash.
+        assert self.chunked_prefill_size == -1, (
+            f"PIC v1 requires chunked_prefill_size=-1, got {self.chunked_prefill_size}"
+        )
+        assert self.page_size in (
+            None,
+            1,
+        ), f"PIC v1 requires page_size=1, got {self.page_size}"
+        if getattr(self, "mamba_scheduler_strategy", "no_buffer") != "no_buffer":
+            logger.warning(
+                "PIC v1 requires mamba_scheduler_strategy='no_buffer'; "
+                "overriding %r -> 'no_buffer'", self.mamba_scheduler_strategy
+            )
+            self.mamba_scheduler_strategy = "no_buffer"
+        assert (
+            getattr(self, "hicache_storage_backend", None) is None
+        ), "PIC v1 does not support HiCache storage"
+        import logging
+
+        log = logging.getLogger(__name__)
+        if self.speculative_algorithm:
+            log.warning("PIC + speculative_algorithm is not fully validated")
+        if getattr(self, "return_token_logprobs", False):
+            log.warning("PIC + token logprobs is not fully validated")
 
     def check_server_args(self):
         # Check parallel size constraints

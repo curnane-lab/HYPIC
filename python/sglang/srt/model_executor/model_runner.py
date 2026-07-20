@@ -2243,6 +2243,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         config = self.model_config.hf_config
         if isinstance(config, BailingHybridConfig):
             return config
+        # Ring-mini (bailing_moe_linear) ships its own trust_remote_code config
+        # class (BailingMoeLinearV2Config); accept it by model_type to keep
+        # the hybrid linear-attn path active.
+        model_type = getattr(config, "model_type", None)
+        if model_type in ("bailing_moe_linear", "bailing_hybrid"):
+            return config
         return None
 
     @property

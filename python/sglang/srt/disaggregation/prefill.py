@@ -414,7 +414,17 @@ class SchedulerDisaggregationPrefillMixin:
         finalizes optimistic requests whose bootstrap completed so they skip
         the post-forward bootstrap check.
         """
-        candidates = [req for req in self.waiting_queue if not is_aborted(req)]
+        # PIC scatter single-seg reqs do a plain local prefill and are pushed
+        # straight onto waiting_queue (see scheduler._add_request_to_queue),
+        # bypassing PD bootstrap — so they carry no disagg_kv_sender. Exclude
+        # them here: poll() only reqs that actually have a bootstrap sender,
+        # else pollers contains None -> AttributeError crashes the scheduler.
+        candidates = [
+            req
+            for req in self.waiting_queue
+            if not is_aborted(req)
+            and getattr(req, "disagg_kv_sender", None) is not None
+        ]
         if not candidates:
             return
         polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -472,6 +482,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self._pic_drain()  # PIC scatter: worker push + combine inject (loop-driven)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -505,6 +516,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self._pic_drain()  # PIC scatter: worker push + combine inject (loop-driven)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -629,6 +641,32 @@ class SchedulerDisaggregationPrefillMixin:
 
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
+                # PIC scatter sub-request: segment is now cached locally; push it to
+                # the combine worker (or, if local, bump lock_ref) instead of doing a
+                # PD KV transfer to decode. ponytail: combine blocks on arrival.
+                if getattr(req, "pic_scatter_single_seg", False):
+                    from sglang.srt.pic.scatter_xfer import pic_scatter_retire
+                    from sglang.srt.pic.segmenter import segment_hash
+
+                    seg_hash = segment_hash(list(req.origin_input_ids))
+                    pic_scatter_retire(self, req, seg_hash, recomputed=True)
+                    continue
+                # PIC combine: this forward consumed the scattered segments, so
+                # drop their lock_ref holds so the entries can evict. See
+                # release_combine_holds (this is the only release for a PD combine).
+                if getattr(req, "is_pic_combine", False):
+                    from sglang.srt.pic.scatter_xfer import (
+                        pic_combine_cached_tokens,
+                        release_combine_holds,
+                    )
+
+                    release_combine_holds(self, req)
+                    # Correct hit-rate accounting: match_prefix on the combine
+                    # node counts every scattered seg as cached (injected pre-
+                    # combine), inflating cached_tokens to a constant ~0.98.
+                    # Rebill from ground-truth per-seg recomputed flags before the
+                    # metadata buffer ships cached_tokens to decode.
+                    req.cached_tokens = pic_combine_cached_tokens(self, req)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]

@@ -1,7 +1,12 @@
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.layers.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from sglang.srt.layers.attention.fla.chunk_intra import chunk_kda_fwd_intra
+from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
+from sglang.srt.layers.attention.fla.kda import chunk_gla_fwd_o_gk, chunk_kda
+from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -12,6 +17,11 @@ from sglang.srt.layers.attention.linear.utils import (
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
+)
+from sglang.srt.pic.conv_tails import (
+    build_prev_tail_slots,
+    capture_conv_tails,
+    load_conv_history,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
@@ -187,6 +197,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self.conv_states_shape = (
+            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
+        )
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
@@ -342,4 +355,477 @@ class KDAAttnBackend(MambaAttnBackendBase):
             lower_bound=getattr(layer, "lower_bound", None),
         )
 
+        return core_attn_out
+
+    # ------------------------------------------------------------------
+    # PIC support
+    # ------------------------------------------------------------------
+    def init_pic_metadata(self, forward_batch: "ForwardBatch"):
+        """Pre-compute PIC segment metadata for KDA layers."""
+        device = forward_batch.input_ids.device
+        pic_miss_segments = forward_batch.pic_miss_segments
+        batch_size = forward_batch.batch_size
+        req_cache_indices = self.forward_metadata.mamba_cache_indices
+
+        seg_lengths: List[int] = []
+        seg_req_idx: List[int] = []
+
+        for req_idx in range(batch_size):
+            prev_start = -1
+            for (start, end) in pic_miss_segments[req_idx]:
+                assert start > prev_start, (
+                    f"pic_miss_segments[{req_idx}] not start-monotonic: "
+                    f"{pic_miss_segments[req_idx]}"
+                )
+                prev_start = start
+                seg_lengths.append(end - start)
+                seg_req_idx.append(req_idx)
+
+        num_segments = len(seg_lengths)
+
+        pic_hit_mamba_slots = forward_batch.pic_hit_mamba_slots
+        pic_miss_mamba_slots = forward_batch.pic_miss_mamba_slots
+        seg_offsets: list = [0]
+        dst_indices_list: list = []
+        persist_src_list: list = []
+        persist_dst_list: list = []
+        trans_persist_src_list: list = []
+        trans_persist_dst_list: list = []
+        seg_cursor = 0
+        seg_conv_slot_list: list = []
+        for req_idx in range(batch_size):
+            miss_segs = pic_miss_segments[req_idx]
+            req_seg_count = len(miss_segs)
+            seg_offsets.append(seg_cursor + req_seg_count)
+
+            miss_slots = pic_miss_mamba_slots[req_idx] if pic_miss_mamba_slots else {}
+            req_dst_slot = req_cache_indices[req_idx].item()
+            for local_i, (start, end) in enumerate(miss_segs):
+                persist_slot_any = miss_slots.get((start, end))
+                if persist_slot_any is not None:
+                    trans_persist_src_list.append(seg_cursor + local_i)
+                    trans_persist_dst_list.append(persist_slot_any)
+                if local_i < req_seg_count - 1:
+                    persist_slot = persist_slot_any
+                    if persist_slot is not None:
+                        persist_src_list.append(seg_cursor + local_i)
+                        persist_dst_list.append(persist_slot)
+                    seg_conv_slot_list.append(
+                        persist_slot if persist_slot is not None else req_dst_slot
+                    )
+                else:
+                    seg_conv_slot_list.append(req_dst_slot)
+            seg_cursor += req_seg_count
+            dst_indices_list.append(req_dst_slot)
+
+        self._pic_fused_persist_src = torch.tensor(persist_src_list, dtype=torch.int32, device=device)
+        self._pic_fused_persist_dst = torch.tensor(persist_dst_list, dtype=torch.int32, device=device)
+        self._pic_trans_persist_src = torch.tensor(trans_persist_src_list, dtype=torch.long, device=device)
+        self._pic_trans_persist_dst = torch.tensor(trans_persist_dst_list, dtype=torch.long, device=device)
+        self._pic_req_last_miss_payload = (
+            torch.tensor(seg_offsets[1:], dtype=torch.long, device=device) - 1
+        )
+        self._pic_req_dst_indices_long = torch.tensor(
+            dst_indices_list, dtype=torch.long, device=device,
+        )
+
+        seg_lens_tensor = torch.tensor(seg_lengths, dtype=torch.int32, device=device)
+        seg_cu_seqlens = torch.zeros(num_segments + 1, dtype=torch.int32, device=device)
+        seg_cu_seqlens[1:] = torch.cumsum(seg_lens_tensor, dim=0)
+
+        self._pic_seg_cu_seqlens = seg_cu_seqlens
+        self._pic_seg_indices = torch.arange(num_segments, dtype=torch.int32, device=device)
+        self._pic_seg_conv_indices = torch.tensor(
+            seg_conv_slot_list, dtype=torch.int32, device=device,
+        )
+        self._pic_seg_lengths = seg_lengths
+
+        prev_tail_slots = build_prev_tail_slots(
+            batch_size=batch_size,
+            pic_hit_segments=forward_batch.pic_hit_segments,
+            pic_hit_mamba_slots=forward_batch.pic_hit_mamba_slots,
+            pic_miss_segments=forward_batch.pic_miss_segments,
+            pic_miss_mamba_slots=forward_batch.pic_miss_mamba_slots,
+            req_cache_indices=req_cache_indices,
+        )
+        self._pic_prev_tail_slot = torch.tensor(
+            prev_tail_slots, dtype=torch.int32, device=device,
+        )
+        self._pic_has_initial_states = torch.tensor(
+            [s >= 0 for s in prev_tail_slots], dtype=torch.bool, device=device,
+        )
+
+        # Allocate per-batch KDA workspaces
+        layer0_cache = self.req_to_token_pool.mamba2_layer_cache(0)
+        ssm0 = layer0_cache.temporal  # (N_slots, H, D, D)
+        _, H, D_k, D_v = ssm0.shape
+        state_shape = (num_segments, H, D_k, D_v)
+        ssm_dtype = ssm0.dtype
+
+        def _alloc(buf, shape, dtype):
+            if (buf is None or buf.shape != shape
+                    or buf.dtype != dtype or buf.device != device):
+                return torch.empty(shape, dtype=dtype, device=device)
+            return buf
+
+        self._pic_temp_states_buf = _alloc(
+            getattr(self, "_pic_temp_states_buf", None), state_shape, ssm_dtype,
+        )
+
+    def forward_extend_pic_addition(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: "ForwardBatch",
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        **kwargs,
+    ):
+        """PIC addition for KDA linear-attn layers."""
+        assert isinstance(mixed_qkv, torch.Tensor)
+        seq_len = mixed_qkv.shape[0]
+        device = mixed_qkv.device
+
+        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv_states_raw = mamba_cache_params.conv[0]  # (N+1, K-1, D)
+        ssm_states = mamba_cache_params.temporal  # (N+1, H, D, D)
+
+        pic_hit_mamba_slots = forward_batch.pic_hit_mamba_slots
+        pic_miss_segments = forward_batch.pic_miss_segments
+        batch_size = forward_batch.batch_size
+
+        # --- Seed h0 of FIRST miss segment per request with Σ S_hit ---
+        temp_states = self._pic_temp_states_buf
+        temp_states.zero_()
+        seg_cursor_a = 0
+        for req_idx in range(batch_size):
+            hit_slots = pic_hit_mamba_slots[req_idx] if pic_hit_mamba_slots else {}
+            n_miss = len(pic_miss_segments[req_idx])
+            if n_miss > 0 and hit_slots:
+                hit_slot_list = list(hit_slots.values())
+                idx_t = torch.tensor(hit_slot_list, dtype=torch.long, device=device)
+                temp_states[seg_cursor_a] = ssm_states.index_select(0, idx_t).sum(dim=0).to(temp_states.dtype)
+            seg_cursor_a += n_miss
+
+        # --- Conv1d (KDA: split q/k/v, 3 separate conv calls) ---
+        conv_tails_per_layer = self.req_to_token_pool.mamba2_conv_tails_cache(
+            layer.layer_id
+        )
+        conv_tails_layer = conv_tails_per_layer[0] if conv_tails_per_layer else None
+
+        # Capture conv tails BEFORE conv1d mutates state
+        capture_conv_tails(
+            mixed_qkv=mixed_qkv,
+            seg_cu_seqlens=self._pic_seg_cu_seqlens,
+            persist_src_idx=self._pic_fused_persist_src,
+            persist_dst_slot=self._pic_fused_persist_dst,
+            conv_tails_layer=conv_tails_layer,
+            layout="kda",
+        )
+
+        # Transpose conv_states to (N+1, D, K-1) for causal_conv1d_fn
+        conv_states = conv_states_raw.transpose(-1, -2)
+
+        # Load conv history from preceding segments
+        load_conv_history(
+            conv_states=conv_states,
+            conv_tails_layer=conv_tails_layer,
+            seg_conv_indices=self._pic_seg_conv_indices,
+            prev_tail_slots=self._pic_prev_tail_slot,
+            has_initial_state=self._pic_has_initial_states,
+            layout="kda",
+        )
+
+        # Split mixed_qkv and conv weights for q/k/v
+        splits = [layer.q_dim, layer.k_dim, layer.v_dim]
+        mixed_qkv_t = mixed_qkv.transpose(0, 1)  # (D, seq) for conv1d
+        q_raw, k_raw, v_raw = mixed_qkv_t.split(splits, dim=0)
+        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+            splits, dim=0
+        )
+        q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
+        if layer.bias is not None:
+            q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+        else:
+            q_bias, k_bias, v_bias = None, None, None
+
+        q = causal_conv1d_fn(
+            q_raw, q_conv_weight, q_bias,
+            activation="silu",
+            conv_states=q_conv_state,
+            has_initial_state=self._pic_has_initial_states,
+            cache_indices=self._pic_seg_conv_indices,
+            query_start_loc=self._pic_seg_cu_seqlens,
+            seq_lens_cpu=self._pic_seg_lengths,
+        ).transpose(0, 1)[:seq_len]
+        k = causal_conv1d_fn(
+            k_raw, k_conv_weight, k_bias,
+            activation="silu",
+            conv_states=k_conv_state,
+            has_initial_state=self._pic_has_initial_states,
+            cache_indices=self._pic_seg_conv_indices,
+            query_start_loc=self._pic_seg_cu_seqlens,
+            seq_lens_cpu=self._pic_seg_lengths,
+        ).transpose(0, 1)[:seq_len]
+        v = causal_conv1d_fn(
+            v_raw, v_conv_weight, v_bias,
+            activation="silu",
+            conv_states=v_conv_state,
+            has_initial_state=self._pic_has_initial_states,
+            cache_indices=self._pic_seg_conv_indices,
+            query_start_loc=self._pic_seg_cu_seqlens,
+            seq_lens_cpu=self._pic_seg_lengths,
+        ).transpose(0, 1)[:seq_len]
+
+        # Reshape to (1, seq_len, H, D) for chunk_kda
+        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
+        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
+        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
+
+        # --- KDA kernel (g=a already pre-gated, beta=b already sigmoid'd) ---
+        core_attn_out = chunk_kda(
+            q=q, k=k, v=v,
+            g=a, beta=b,
+            initial_state=temp_states,
+            initial_state_indices=self._pic_seg_indices,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=self._pic_seg_cu_seqlens,
+        )
+
+        # --- State persistence ---
+        if self._pic_trans_persist_src.numel() > 0:
+            ssm_states[self._pic_trans_persist_dst] = temp_states[self._pic_trans_persist_src]
+        ssm_states[self._pic_req_dst_indices_long] = temp_states[self._pic_req_last_miss_payload]
+
+        return core_attn_out
+
+    def forward_extend_pic_transition(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: "ForwardBatch",
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        **kwargs,
+    ):
+        """PIC transition mode for KDA linear-attn layers.
+
+        Steps:
+        1. Conv1d (same as addition)
+        2. Inline KDA FLA steps to get w, u, kg, Aqk
+        3. fwd_h with initial_state=0 → per-seg S
+        4. fwd_h with initial_state=I, u=0 → per-seg T
+        5. Persist S, T; compose h_accum = h_accum @ T + S
+        6. Pass3: fwd_h + fwd_o with composed h0 → final attention output
+        """
+        assert isinstance(mixed_qkv, torch.Tensor)
+        seq_len = mixed_qkv.shape[0]
+        device = mixed_qkv.device
+
+        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv_states_raw = mamba_cache_params.conv[0]
+        ssm_states = mamba_cache_params.temporal
+        transition_pool = mamba_cache_params.transition
+        assert transition_pool is not None, (
+            "PIC transition mode requires transition buffer in MambaPool."
+        )
+
+        pic_hit_mamba_slots = forward_batch.pic_hit_mamba_slots
+        pic_miss_mamba_slots = forward_batch.pic_miss_mamba_slots
+        pic_miss_segments = forward_batch.pic_miss_segments
+        pic_hit_segments = forward_batch.pic_hit_segments
+        req_cache_indices = self.forward_metadata.mamba_cache_indices
+        batch_size = forward_batch.batch_size
+
+        # --- Conv1d (same as addition) ---
+        conv_tails_per_layer = self.req_to_token_pool.mamba2_conv_tails_cache(
+            layer.layer_id
+        )
+        conv_tails_layer = conv_tails_per_layer[0] if conv_tails_per_layer else None
+        capture_conv_tails(
+            mixed_qkv=mixed_qkv,
+            seg_cu_seqlens=self._pic_seg_cu_seqlens,
+            persist_src_idx=self._pic_fused_persist_src,
+            persist_dst_slot=self._pic_fused_persist_dst,
+            conv_tails_layer=conv_tails_layer,
+            layout="kda",
+        )
+        conv_states = conv_states_raw.transpose(-1, -2)
+        load_conv_history(
+            conv_states=conv_states,
+            conv_tails_layer=conv_tails_layer,
+            seg_conv_indices=self._pic_seg_conv_indices,
+            prev_tail_slots=self._pic_prev_tail_slot,
+            has_initial_state=self._pic_has_initial_states,
+            layout="kda",
+        )
+
+        splits = [layer.q_dim, layer.k_dim, layer.v_dim]
+        mixed_qkv_t = mixed_qkv.transpose(0, 1)
+        q_raw, k_raw, v_raw = mixed_qkv_t.split(splits, dim=0)
+        q_conv_weight, k_conv_weight, v_conv_weight = layer.conv_weights.split(
+            splits, dim=0
+        )
+        q_conv_state, k_conv_state, v_conv_state = conv_states.split(splits, dim=-2)
+        if layer.bias is not None:
+            q_bias, k_bias, v_bias = layer.bias.split(splits, dim=0)
+        else:
+            q_bias, k_bias, v_bias = None, None, None
+
+        q = causal_conv1d_fn(
+            q_raw, q_conv_weight, q_bias, activation="silu",
+            conv_states=q_conv_state,
+            has_initial_state=self._pic_has_initial_states,
+            cache_indices=self._pic_seg_conv_indices,
+            query_start_loc=self._pic_seg_cu_seqlens,
+            seq_lens_cpu=self._pic_seg_lengths,
+        ).transpose(0, 1)[:seq_len]
+        k = causal_conv1d_fn(
+            k_raw, k_conv_weight, k_bias, activation="silu",
+            conv_states=k_conv_state,
+            has_initial_state=self._pic_has_initial_states,
+            cache_indices=self._pic_seg_conv_indices,
+            query_start_loc=self._pic_seg_cu_seqlens,
+            seq_lens_cpu=self._pic_seg_lengths,
+        ).transpose(0, 1)[:seq_len]
+        v = causal_conv1d_fn(
+            v_raw, v_conv_weight, v_bias, activation="silu",
+            conv_states=v_conv_state,
+            has_initial_state=self._pic_has_initial_states,
+            cache_indices=self._pic_seg_conv_indices,
+            query_start_loc=self._pic_seg_cu_seqlens,
+            seq_lens_cpu=self._pic_seg_lengths,
+        ).transpose(0, 1)[:seq_len]
+
+        # Reshape to (1, seq_len, H, D)
+        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
+        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
+        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
+
+        # --- Inline KDA FLA steps ---
+        # KDA uses l2norm on q/k before the kernel
+        q_normed = l2norm_fwd(q.contiguous())
+        k_normed = l2norm_fwd(k.contiguous())
+        v_contig = v.contiguous()
+        # a = forget_gate (already fused_kda_gate'd), b = beta (already sigmoid'd)
+        g_contig = a.contiguous()
+        beta_contig = b.contiguous()
+        scale = layer.head_k_dim ** -0.5
+
+        g_cumsum = chunk_local_cumsum(
+            g_contig, chunk_size=64, cu_seqlens=self._pic_seg_cu_seqlens
+        )
+        w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
+            q=q_normed, k=k_normed, v=v_contig,
+            gk=g_cumsum, beta=beta_contig, scale=scale,
+            cu_seqlens=self._pic_seg_cu_seqlens, chunk_size=64,
+        )
+
+        # --- Step 2: fwd_h with initial_state=0 → per-seg state S ---
+        temp_states = self._pic_temp_states_buf
+        temp_states.zero_()
+        chunk_gated_delta_rule_fwd_h(
+            k=kg, w=w, u=u, gk=g_cumsum,
+            initial_state=temp_states,
+            initial_state_indices=self._pic_seg_indices,
+            cu_seqlens=self._pic_seg_cu_seqlens,
+        )
+
+        # --- Step 3: T computation (h0=I, u=0) ---
+        _, H_dim, D_k, D_v = ssm_states.shape
+        temp_transitions = getattr(self, "_pic_temp_transitions_buf", None)
+        trans_shape = (num_segments, H_dim, D_v, D_k)
+        if (temp_transitions is None or temp_transitions.shape != trans_shape
+                or temp_transitions.device != device):
+            temp_transitions = torch.empty(trans_shape, dtype=ssm_states.dtype, device=device)
+            self._pic_temp_transitions_buf = temp_transitions
+        temp_transitions.zero_()
+        temp_transitions.diagonal(dim1=-2, dim2=-1).fill_(1)
+
+        u_zero_shape = (1, seq_len, H_dim, D_v)
+        u_zero = getattr(self, "_pic_u_zero_buf", None)
+        if (u_zero is None or u_zero.shape != u_zero_shape
+                or u_zero.device != device):
+            u_zero = torch.zeros(u_zero_shape, dtype=v_contig.dtype, device=device)
+            self._pic_u_zero_buf = u_zero
+
+        chunk_gated_delta_rule_fwd_h(
+            k=kg, w=w, u=u_zero, gk=g_cumsum,
+            initial_state=temp_transitions,
+            initial_state_indices=self._pic_seg_indices,
+            cu_seqlens=self._pic_seg_cu_seqlens,
+        )
+
+        # --- Step 4: Persist S, T to pool ---
+        if self._pic_trans_persist_src.numel() > 0:
+            ssm_states[self._pic_trans_persist_dst] = temp_states[self._pic_trans_persist_src]
+            transition_pool[self._pic_trans_persist_dst] = (
+                temp_transitions[self._pic_trans_persist_src].to(transition_pool.dtype)
+            )
+
+        # --- Step 5: Compose h_accum = h_accum @ T + S ---
+        kernel_h0_shape = (num_segments, H_dim, D_k, D_v)
+        kernel_h0_buf = getattr(self, "_pic_kernel_h0_buf", None)
+        if (kernel_h0_buf is None or kernel_h0_buf.shape != kernel_h0_shape
+                or kernel_h0_buf.device != device):
+            kernel_h0_buf = torch.empty(kernel_h0_shape, dtype=ssm_states.dtype, device=device)
+            self._pic_kernel_h0_buf = kernel_h0_buf
+        kernel_h0_buf.zero_()
+
+        h_accum_shape = (batch_size, H_dim, D_k, D_v)
+        h_accum_buf = getattr(self, "_pic_h_accum_buf", None)
+        if (h_accum_buf is None or h_accum_buf.shape != h_accum_shape
+                or h_accum_buf.device != device):
+            h_accum_buf = torch.empty(h_accum_shape, dtype=torch.float32, device=device)
+            self._pic_h_accum_buf = h_accum_buf
+
+        seg_cursor = 0
+        for req_idx in range(batch_size):
+            hit_slots_dict = (
+                pic_hit_mamba_slots[req_idx] if pic_hit_mamba_slots else {}
+            )
+            hit_segs = pic_hit_segments[req_idx] if pic_hit_segments else []
+            miss_segs = pic_miss_segments[req_idx]
+            miss_slots_dict = (
+                pic_miss_mamba_slots[req_idx] if pic_miss_mamba_slots else {}
+            )
+            last_miss_payload = (
+                seg_cursor + len(miss_segs) - 1 if miss_segs else -1
+            )
+
+            req_order = []
+            for (s, e, h) in hit_segs:
+                req_order.append((s, hit_slots_dict[h], None))
+            for local_i, (s, e) in enumerate(miss_segs):
+                req_order.append(
+                    (s, miss_slots_dict[(s, e)], seg_cursor + local_i)
+                )
+            req_order.sort(key=lambda x: x[0])
+
+            h_accum = torch.zeros(
+                H_dim, D_k, D_v, dtype=torch.float32, device=device,
+            )
+            for _, slot, miss_payload in req_order:
+                if miss_payload == last_miss_payload:
+                    kernel_h0_buf[miss_payload] = h_accum.to(kernel_h0_buf.dtype)
+                T = transition_pool[slot].float()
+                S = ssm_states[slot].float()
+                h_accum = torch.bmm(h_accum, T) + S
+            h_accum_buf[req_idx] = h_accum
+            seg_cursor += len(miss_segs)
+
+        ssm_states[self._pic_req_dst_indices_long] = h_accum_buf.to(ssm_states.dtype)
+
+        # --- Step 6: Pass3 — re-run with composed h0 ---
+        _h2, v_new2 = chunk_gated_delta_rule_fwd_h(
+            k=kg, w=w, u=u, gk=g_cumsum,
+            initial_state=kernel_h0_buf,
+            initial_state_indices=self._pic_seg_indices,
+            cu_seqlens=self._pic_seg_cu_seqlens,
+        )
+        core_attn_out = chunk_gla_fwd_o_gk(
+            q=q_normed, v=v_new2, g=g_cumsum, A=Aqk, h=_h2, o=v_contig,
+            scale=scale,
+            cu_seqlens=self._pic_seg_cu_seqlens, chunk_size=64,
+        )
         return core_attn_out

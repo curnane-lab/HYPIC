@@ -602,6 +602,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if skip_attn_backend_init:
             self.mark_forward_metadata_ready()
 
+    # PIC: None when PIC is disabled for this batch.
+    pic_mode: Optional[str] = None
+    pic_hit_segments: Optional[List[List[Tuple[int, int, bytes]]]] = None
+    pic_miss_segments: Optional[List[List[Tuple[int, int]]]] = None
+    # Per-req dict: seg_hash -> mamba_state_slot for hit segments (SSM state lookup)
+    pic_hit_mamba_slots: Optional[List[Dict[bytes, int]]] = None
+    # Per-req dict: (start, end) -> mamba_slot for miss segments (SSM state persist)
+    pic_miss_mamba_slots: Optional[List[Dict[Tuple[int, int], int]]] = None
+    # transition_rope: per-req segmentation metadata for Phase A/B/C in full-attn.
+    # Each entry is a dict with keys:
+    #   "local_miss": List[(start, end, private_slots, public_slots)]
+    #   "local_hit":  List[(start, end, private_slots, entry_public_slots)]
+    #   "global":     (start, end, private_slots) | None
+    # All slot tensors are int64 on device.
+    pic_rope_meta: Optional[List[Dict[str, object]]] = None
+
+    @property
+    def pic_policy(self):
+        """PICPolicy for this batch's pic_mode, or None when PIC is off."""
+        if self.pic_mode is None:
+            return None
+        from sglang.srt.pic.policy import POLICIES
+
+        return POLICIES[self.pic_mode]
+
     @classmethod
     def init_new(
         cls,
@@ -715,6 +740,91 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
         ret._maybe_init_non_generation_fields(batch)
+        # PIC: copy per-request segment metadata when PIC is active.
+        if batch.pic_mode is not None and batch.reqs is not None:
+            from sglang.srt.pic.policy import POLICIES
+
+            _pic_policy = POLICIES[batch.pic_mode]
+            ret.pic_mode = batch.pic_mode
+            ret.pic_hit_segments = [r.pic_hit_segments for r in batch.reqs]
+            ret.pic_miss_segments = [r.pic_miss_segments for r in batch.reqs]
+            # For GDN linear-attn lapic_addition: mamba slot lookups.
+            ret.pic_hit_mamba_slots = [
+                {
+                    seg_hash: entry.mamba_state_slot
+                    for seg_hash, entry in getattr(r, "pic_segment_entries", {}).items()
+                }
+                for r in batch.reqs
+            ]
+            # Schema:
+            #   addition/transition: v = (kv_slots, mamba_slot)              -> mamba = v[1]
+            #   transition_rope:     v = (private, public_or_None, mamba)    -> mamba = v[2]
+            _mamba_idx = 2 if _pic_policy.rope else 1
+            ret.pic_miss_mamba_slots = [
+                {
+                    k: v[_mamba_idx]
+                    for k, v in getattr(r, "pic_miss_segment_slots", {}).items()
+                    if v[_mamba_idx] is not None
+                }
+                for r in batch.reqs
+            ]
+            # transition_rope[_recompute]: build per-request (local_miss / local_hit / global)
+            # metadata. The full-attn forward (Phase A/B/C) consumes this.
+            if _pic_policy.rope:
+                rope_meta: List[Dict[str, object]] = []
+                for r in batch.reqs:
+                    pic_segs = r.pic_segments or []
+                    # A single-segment request is cacheable (matches pic_alloc /
+                    # picache single-seg patch): only treat the last segment as
+                    # the never-cached global when there is more than one segment.
+                    global_seg_tuple = (
+                        tuple(pic_segs[-1]) if len(pic_segs) > 1 else None
+                    )
+                    miss_slots_map = getattr(r, "pic_miss_segment_slots", {}) or {}
+                    hit_priv_map = getattr(r, "pic_rope_hit_private_slots", {}) or {}
+                    local_miss = []
+                    local_hit = []
+                    global_info = None
+                    # Iterate full pic_segments in original order so we know which
+                    # is hit vs miss without scanning twice.
+                    hit_by_range = {
+                        (s, e): seg_hash for (s, e, seg_hash) in r.pic_hit_segments
+                    }
+                    miss_by_range = {(s, e): True for (s, e) in r.pic_miss_segments}
+                    for (start, end) in pic_segs:
+                        if (start, end) == global_seg_tuple:
+                            # Global must be a miss (cache-by-design); private only.
+                            if (start, end) in miss_slots_map:
+                                priv, pub, _mamba = miss_slots_map[(start, end)]
+                                global_info = (start, end, priv)
+                            continue
+                        if (start, end) in miss_by_range:
+                            priv, pub, _mamba = miss_slots_map[(start, end)]
+                            assert pub is not None, (
+                                "local miss segment must have public slot"
+                            )
+                            local_miss.append((start, end, priv, pub))
+                        elif (start, end) in hit_by_range:
+                            info = hit_priv_map.get((start, end))
+                            if info is not None:
+                                priv, entry_pub = info
+                                local_hit.append((start, end, priv, entry_pub))
+                    # transition_rope_recompute: per hit/miss seg seam offsets.
+                    # Maps to absolute positions in fill_ids (real-pos), used by
+                    # Phase C to find batch-local indices of seam Q tokens.
+                    seam_info = None
+                    if _pic_policy.recompute:
+                        hit_seam = getattr(r, "pic_hit_seam_positions", {}) or {}
+                        seam_info = {
+                            "hit_seam": hit_seam,  # {(s,e): sink_pos}
+                        }
+                    rope_meta.append({
+                        "local_miss": local_miss,
+                        "local_hit": local_hit,
+                        "global": global_info,
+                        "seam": seam_info,
+                    })
+                ret.pic_rope_meta = rope_meta
 
         device = model_runner.device
 
@@ -828,6 +938,28 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if ret.positions is None:
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
+
+            # PIC: override positions with REAL fill_ids indices for each miss
+            # token. compute_position assumes input_ids is a contiguous
+            # fill_ids[prefix_len:] slice; PIC scatter-gathers miss tokens
+            # (potentially non-contiguous when hits aren't all at the front),
+            # so prefix_len + i is wrong. Applied unconditionally under PIC.
+            # NOTE: this sets ForwardBatch.positions, but the `positions` arg
+            # threaded into the model can be the stale pre-override tensor, so
+            # position-consuming models (Qwen3.5 full-attn rope, Ring/Bailing
+            # SegLA) must rope from forward_batch.positions, not the arg.
+            if batch.pic_mode is not None and batch.reqs is not None:
+                pic_pos_chunks = []
+                for r in batch.reqs:
+                    pos = getattr(r, "pic_miss_token_positions", None)
+                    if pos is None:
+                        pic_pos_chunks = None
+                        break
+                    pic_pos_chunks.append(pos)
+                if pic_pos_chunks:
+                    ret.positions = torch.cat(pic_pos_chunks).to(
+                        device, non_blocking=True
+                    )
 
         if model_runner.use_ngram_embedding:
             ret._init_ngram_embedding_info(batch, device)
@@ -1060,7 +1192,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     batch.extend_lens[batch_idx],
                     batch.prefix_lens[batch_idx],
                 )
-                if (
+                # PIC: only the miss tokens are forwarded, not the full
+                # [prefix, prefix+seq) range. Their real positions live in
+                # pic_miss_token_positions; for text tokens M-RoPE is just those
+                # positions across all 3 sections. This takes priority over both
+                # the text-only range and the mm_input.mrope_positions slice —
+                # both size to the full extend length and would over-size
+                # mrope_positions vs the reduced input_ids (crash in the
+                # cuda-graph buffer registry / eager load_batch). PIC is a
+                # text-prefix-cache path, so miss tokens are text positions.
+                pic_pos = getattr(
+                    batch.reqs[batch_idx], "pic_miss_token_positions", None
+                )
+                if pic_pos is not None:
+                    mrope_positions = pic_pos.reshape(1, -1).repeat(3, 1)
+                elif (
                     mm_input is None
                     or get_global_server_args().rl_on_policy_target is not None
                 ):

@@ -16,6 +16,8 @@ pub enum PolicyType {
     Manual,
     ConsistentHashing,
     PrefixHash,
+    PicRoundRobin,
+    PicLpt,
 }
 
 #[pyclass(eq)]
@@ -501,6 +503,8 @@ impl Router {
                     prefix_token_count: 256,
                     load_factor: 1.25,
                 },
+                PolicyType::PicRoundRobin => ConfigPolicyConfig::PicRoundRobin,
+                PolicyType::PicLpt => ConfigPolicyConfig::PicLpt,
             }
         };
 

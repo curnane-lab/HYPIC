@@ -879,6 +879,29 @@ async def add_external_corpus(request: Request):
     )
 
 
+@app.post("/pic_scatter/handle")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pic_scatter_handle(request: Request):
+    """Worker-side (scatter opt A): receive combine's preallocated dst handle
+    so the worker can RDMA WRITE its segment directly (no prealloc round-trip)."""
+    from sglang.srt.managers.io_struct import PicScatterHandleReq
+
+    obj = PicScatterHandleReq(**(await request.json()))
+    result = await _global_state.tokenizer_manager.pic_scatter_handle(obj)
+    return ORJSONResponse(dataclasses.asdict(result))
+
+
+@app.get("/pic_scatter/cached_segments")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pic_scatter_cached_segments(request: Request):
+    """Report the text_hashes of segments this worker has scatter-warmed.
+
+    The router pulls this every 60s to rebuild its segment-cache directory.
+    """
+    hashes = getattr(_global_state.tokenizer_manager, "_pic_cached_text_hashes", None)
+    return ORJSONResponse({"text_hashes": sorted(hashes) if hashes else []})
+
+
 @app.post("/remove_external_corpus")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def remove_external_corpus(request: Request):
@@ -1996,7 +2019,14 @@ def _execute_server_warmup(server_args: ServerArgs):
     model_info = res.json()
 
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
-    is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
+    # PIC is a text-prefix segment cache and does not support multimodal inputs:
+    # segmenting/reducing an image request's tokens breaks mrope sizing and the
+    # image-embedding scatter. Force text warmup so PIC servers boot on VLMs.
+    is_vlm = (
+        bool(model_info.get("has_image_understanding", False))
+        and not is_mps()
+        and not server_args.pic_enable
+    )
     if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"

@@ -187,6 +187,9 @@ class MatchResult(NamedTuple):
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+    # PIC: per-segment entries aligned to req.pic_segments (None for miss/last).
+    # None for non-PIC caches. See qianyou/2026-05-28-pic-sglang-design.md §5.4.
+    pic_segment_entries: Optional[list] = None
 
 
 def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:

@@ -13,6 +13,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
+from sglang.srt.pic.policy import POLICIES, PICCompose
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -169,6 +170,19 @@ class ModelRunnerKVCacheMixin:
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
             per_req = config.mamba2_cache_params.mamba_cache_per_req
 
+            # PIC transition modes add a transition buffer per slot — include it
+            # in the per-req budget so the auto-fit reserves room for it.
+            if server_args.pic_enable and POLICIES[server_args.pic_mode].compose is PICCompose.TRANSITION:
+                temporal_shape = config.mamba2_cache_params.shape.temporal
+                transition_numel = (
+                    temporal_shape[0] * temporal_shape[2] * temporal_shape[2]
+                )
+                transition_bytes = (
+                    transition_numel
+                    * config.mamba2_cache_params.dtype.temporal.itemsize
+                )
+                per_req += transition_bytes * len(config.mamba2_cache_params.layers)
+
             # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
             # The mamba budget (from the ratio split) must cover both:
             #   1. main mamba state: max_mamba_cache_size * per_req
@@ -221,6 +235,18 @@ class ModelRunnerKVCacheMixin:
             * config.mamba2_cache_params.mamba_cache_per_req
             / (1 << 30)
         )
+        # For PIC transition, also account for the transition buffer in memory usage
+        if server_args.pic_enable and POLICIES[server_args.pic_mode].compose is PICCompose.TRANSITION:
+            temporal_shape = config.mamba2_cache_params.shape.temporal
+            transition_numel = temporal_shape[0] * temporal_shape[2] * temporal_shape[2]
+            transition_bytes = transition_numel * config.mamba2_cache_params.dtype.temporal.itemsize
+            transition_memory = (
+                server_args.max_mamba_cache_size
+                * transition_bytes
+                * len(config.mamba2_cache_params.layers)
+                / (1 << 30)
+            )
+            mamba_state_memory += transition_memory
         return total_rest_memory - mamba_state_memory
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
@@ -402,6 +428,11 @@ class ModelRunnerKVCacheMixin:
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
+                    pic_mode=(
+                        self.server_args.pic_mode
+                        if self.server_args.pic_enable
+                        else None
+                    ),
                 )
             else:
                 # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
@@ -1076,6 +1107,20 @@ class ModelRunnerKVCacheMixin:
         return config
 
     def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
+        # Bailing-linear trust_remote_code configs need mamba2_cache_params
+        # built lazily once the attention TP group is alive.
+        builder = getattr(
+            self.model_config, "_build_bailing_linear_mamba_cache_params", None
+        )
+        if callable(builder):
+            try:
+                builder()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Deferred bailing-linear mamba cache params build failed: %s",
+                    exc,
+                )
+
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert (
                 self.memory_pool_config is not None

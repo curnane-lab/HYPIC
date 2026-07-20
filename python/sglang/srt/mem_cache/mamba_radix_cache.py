@@ -737,6 +737,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         req.cache_protected_len = len(new_indices)
         req.mamba_last_track_seqlen = None
+        req.mamba_last_track_buffer_idx = None
         req.last_node = new_last_node
 
     def pretty_print(self) -> None:

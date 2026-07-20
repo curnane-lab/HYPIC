@@ -667,7 +667,12 @@ class PrefillAdder:
         self._update_prefill_budget(prefix_len, trunc_len, 0, req.retracted_stain)
 
     def _req_inc_lock_ref(self, req: Req):
-        result = self.tree_cache.inc_lock_ref(req.last_node)
+        from sglang.srt.pic.picache import PICache
+
+        if isinstance(self.tree_cache, PICache):
+            result = self.tree_cache.inc_lock_ref(req)
+        else:
+            result = self.tree_cache.inc_lock_ref(req.last_node)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
 
@@ -739,6 +744,11 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
+        from sglang.srt.pic.picache import PICache
+
+        if isinstance(self.tree_cache, PICache):
+            yield None
+            return
         dec_lock_params = None
         try:
             result = self.tree_cache.inc_lock_ref(last_node)

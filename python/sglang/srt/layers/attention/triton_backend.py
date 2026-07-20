@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -39,6 +40,38 @@ _is_gfx942 = is_gfx942_supported()
 
 if _is_cuda:
     from sgl_kernel.utils import is_arch_support_pdl
+
+
+def _moti2_rank() -> int:
+    try:
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank()
+    except Exception:
+        return 0
+
+
+def _dump_moti2_context_kv(layer, q, k_buf, v_buf, kv_indices, positions):
+    dump_dir = os.environ.get("PIC_MOTI2_DUMP_DIR")
+    if not dump_dir:
+        return
+    if q.shape[0] < int(os.environ.get("PIC_MOTI2_MIN_TOKENS", "0")):
+        return
+    os.makedirs(dump_dir, exist_ok=True)
+    rank = _moti2_rank()
+    idx = kv_indices.detach().to(torch.long)
+    torch.save(
+        {
+            "layer": int(layer.layer_id),
+            "rank": int(rank),
+            "q": q.detach().view(q.shape[0], layer.tp_q_head_num, layer.qk_head_dim).to(torch.float32).cpu(),
+            "k": k_buf.index_select(0, idx).detach().to(torch.float32).cpu(),
+            "v": v_buf.index_select(0, idx).detach().to(torch.float32).cpu(),
+            "positions": positions.detach().cpu() if positions is not None else None,
+            "kv_indices": idx.cpu(),
+        },
+        os.path.join(dump_dir, f"qwen_attn_plan_L{int(layer.layer_id):03d}_r{rank}.pt"),
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -1157,13 +1190,16 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        _dump_moti2_context_kv(layer, q, k_buffer, v_buffer, kv_indices, forward_batch.positions)
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
             v.contiguous(),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            k_buffer,
+            v_buffer,
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,

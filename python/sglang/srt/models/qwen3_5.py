@@ -15,6 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -34,7 +35,7 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_rank
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
@@ -66,6 +67,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.pic import pic_rope_positions
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -111,6 +113,72 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
+
+
+def _dump_moti2_full_attn(
+    layer_id, positions, q, k, v, forward_batch, num_heads, num_kv_heads, head_dim
+):
+    dump_dir = os.environ.get("PIC_MOTI2_DUMP_DIR")
+    if not dump_dir:
+        return
+    if get_is_capture_mode():
+        return
+    min_tokens = int(os.environ.get("PIC_MOTI2_MIN_TOKENS", "0"))
+    if q.shape[0] < min_tokens:
+        return
+    os.makedirs(dump_dir, exist_ok=True)
+    rank = get_tensor_model_parallel_rank()
+    path = os.path.join(dump_dir, f"qwen_attn_L{int(layer_id):03d}_r{rank}.pt")
+    out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+    torch.save(
+        {
+            "layer": int(layer_id),
+            "rank": int(rank),
+            "positions": positions.detach().cpu(),
+            "out_cache_loc": out_cache_loc.detach().cpu() if out_cache_loc is not None else None,
+            "q": q.detach().view(q.shape[0], num_heads, head_dim).to(torch.float32).cpu(),
+            "k": k.detach().view(k.shape[0], num_kv_heads, head_dim).to(torch.float32).cpu(),
+            "v": v.detach().view(v.shape[0], num_kv_heads, head_dim).to(torch.float32).cpu(),
+        },
+        path,
+    )
+
+
+def _dump_moti2_context_attn(layer_id, positions, q, forward_batch, num_heads, head_dim):
+    dump_dir = os.environ.get("PIC_MOTI2_DUMP_DIR")
+    if not dump_dir or get_is_capture_mode():
+        return
+    if q.shape[0] < int(os.environ.get("PIC_MOTI2_MIN_TOKENS", "0")):
+        return
+    # v0514: pools live on the attn backend, not ForwardBatch — reach via forward_context.
+    from sglang.srt.model_executor.forward_context import (
+        get_req_to_token_pool,
+        get_token_to_kv_pool,
+    )
+
+    req_to_token_pool = get_req_to_token_pool()
+    token_to_kv_pool = get_token_to_kv_pool()
+    if req_to_token_pool is None or token_to_kv_pool is None:
+        return
+    os.makedirs(dump_dir, exist_ok=True)
+    rank = get_tensor_model_parallel_rank()
+    req_idx = int(forward_batch.req_pool_indices[0].item())
+    seq_len = int(forward_batch.seq_lens[0].item())
+    slots = req_to_token_pool.req_to_token[req_idx, :seq_len].to(torch.long)
+    slots = slots[slots >= 0]
+    k_buf, v_buf = token_to_kv_pool.get_kv_buffer(layer_id)
+    torch.save(
+        {
+            "layer": int(layer_id),
+            "rank": int(rank),
+            "positions": positions.detach().cpu(),
+            "q": q.detach().view(q.shape[0], num_heads, head_dim).to(torch.float32).cpu(),
+            "k": k_buf.index_select(0, slots).detach().to(torch.float32).cpu(),
+            "v": v_buf.index_select(0, slots).detach().to(torch.float32).cpu(),
+            "kv_slots": slots.detach().cpu(),
+        },
+        os.path.join(dump_dir, f"qwen_attn_ctx_L{int(layer_id):03d}_r{rank}.pt"),
+    )
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -696,6 +764,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
+        from sglang.srt.pic.diag_layer_dump import dump as _pic_dump, enabled as _pic_diag_on
+        if _pic_diag_on():
+            _pic_dump(self.layer_id, "linear",
+                      hidden_states if residual is None else hidden_states + residual)
+
         return hidden_states, residual
 
 
@@ -885,7 +958,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
-    def forward_prepare_native(self, positions, hidden_states):
+    def forward_prepare_native(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -901,7 +974,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             gate = None
 
         q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        # PIC: rope from the corrected real per-segment positions on
+        # ForwardBatch (the threaded `positions` arg can be a stale contiguous
+        # fallback). No-op for non-PIC requests. See pic.pic_rope_positions.
+        q, k = self.rotary_emb(
+            pic_rope_positions(positions, q, forward_batch), q, k
+        )
         return q, k, v, gate
 
     def forward_prepare_hip(self, positions, hidden_states):
@@ -971,6 +1049,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             q, k, v, gate = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
         else:
             q, k, v, gate = self.forward_prepare_npu(
@@ -979,7 +1058,26 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
+        _dump_moti2_full_attn(
+            self.layer_id,
+            positions,
+            q,
+            k,
+            v,
+            forward_batch,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+        )
         attn_output = self.attn(q, k, v, forward_batch)
+        _dump_moti2_context_attn(
+            self.layer_id,
+            positions,
+            q,
+            forward_batch,
+            self.num_heads,
+            self.head_dim,
+        )
 
         if self.attn_output_gate:
             if not _is_npu:
@@ -1046,6 +1144,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+
+        from sglang.srt.pic.diag_layer_dump import dump as _pic_dump, enabled as _pic_diag_on
+        if _pic_diag_on():
+            _pic_dump(self.layer_id, "full",
+                      hidden_states if residual is None else hidden_states + residual)
 
         return hidden_states, residual
 

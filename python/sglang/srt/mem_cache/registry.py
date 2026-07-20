@@ -174,6 +174,45 @@ def _create_unified_radix_cache(
 
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Route to the matching factory to construct Radix Cache."""
+    server_args = ctx.server_args
+
+    if server_args.pic_enable:
+        from sglang.srt.pic.picache import PICache
+
+        model_arch = ctx.model_config.hf_config.architectures[0]
+        _PIC_ALLOWED_ARCHS = {
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+            "KimiLinearForCausalLM",
+            "BailingMoeLinearV2ForCausalLM",
+            "BailingMoELinearForCausalLM",
+        }
+        assert model_arch in _PIC_ALLOWED_ARCHS, (
+            f"PIC whitelist: {_PIC_ALLOWED_ARCHS} supported, got {model_arch}"
+        )
+        _PIC_ROPE_MODES = {"transition_rope", "transition_rope_recompute"}
+        if server_args.pic_mode in _PIC_ROPE_MODES and model_arch == "KimiLinearForCausalLM":
+            raise ValueError(
+                f"PIC mode '{server_args.pic_mode}' requires RoPE on full-attn layers, "
+                f"but {model_arch} uses MLA NoPE. Use 'addition' or 'transition' instead."
+            )
+        req_to_token_pool = ctx.params.req_to_token_pool
+        cache = PICache(
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=ctx.params.token_to_kv_pool_allocator,
+            mamba_pool=req_to_token_pool.mamba_pool,
+            page_size=server_args.page_size,
+            disable=False,
+            pic_mode=server_args.pic_mode,
+            is_decode=server_args.disaggregation_mode == "decode",
+        )
+        logger.info(
+            "PIC enabled: mode=%s, separator=%r",
+            server_args.pic_mode,
+            server_args.pic_separator_str,
+        )
+        return cache
+
     name = ctx.server_args.radix_cache_backend
     if name:
         factory = get_radix_cache_factory(name)

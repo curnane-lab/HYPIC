@@ -31,6 +31,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    PicScatterHandleOutput,
+    PicScatterHandleReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadsReqOutput,
@@ -253,6 +255,17 @@ class TokenizerControlMixin:
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+
+    async def pic_scatter_handle(
+        self: TokenizerManager, obj: PicScatterHandleReq
+    ) -> PicScatterHandleOutput:
+        # Fire-and-forget (see close_session): just send to the scheduler and
+        # return. The worker's scheduler stashes the handle on its next recv tick
+        # (handle_pic_scatter_handle) and WRITEs from try_push_pending — awaiting
+        # a response here would block on the worker's forward loop and deadlock.
+        self.auto_create_handle_loop()
+        self.send_to_scheduler.send_pyobj(obj)
+        return PicScatterHandleOutput(ok=True)
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

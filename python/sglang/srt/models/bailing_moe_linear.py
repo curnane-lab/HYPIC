@@ -14,6 +14,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.pic import pic_rope_positions as _pic_rope_positions
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
@@ -363,6 +364,17 @@ class BailingMoE(nn.Module):
 
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
+            from sglang.srt.pic.diag_layer_dump import (
+                dump_topk as _pic_dump_topk,
+                enabled as _pic_diag_on,
+            )
+            if _pic_diag_on():
+                _pic_dump_topk(
+                    self.layer_id,
+                    "moe_topk",
+                    topk_output.topk_ids,
+                    weights=topk_output.topk_weights,
+                )
             final_hidden_states = self.experts(hidden_states, topk_output)
 
             if self.num_shared_experts > 0:
@@ -602,7 +614,9 @@ class BailingMoELinearAttention(nn.Module):
             k = k.reshape(-1, self.kv_size_per_rank)
 
         if self.linear_rope:
-            q, k = self.rotary_emb(positions, q, k)
+            q, k = self.rotary_emb(
+                _pic_rope_positions(positions, q, forward_batch), q, k
+            )
 
         q = q.view((qkv.shape[0], self.tp_heads, self.head_dim))
         k = k.view((qkv.shape[0], self.tp_kv_heads, self.head_dim))
@@ -623,6 +637,12 @@ class BailingMoELinearAttention(nn.Module):
         hidden = hidden.data.to(hidden_states.dtype)
         hidden, _ = self.dense(hidden)
 
+        from sglang.srt.pic.diag_layer_dump import (
+            dump as _pic_dump,
+            enabled as _pic_diag_on,
+        )
+        if _pic_diag_on():
+            _pic_dump(self.layer_id, "proj_o", hidden)
         return hidden
 
 
@@ -680,6 +700,12 @@ class BailingMoEAttention(nn.Module):
             bias=config.use_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            # The LayerCommunicator.prepare_mlp path all-reduces the attention
+            # output itself (matching the linear-attn dense above). Leaving the
+            # default reduce_results=True here double-reduces the full-attn
+            # output at tp>1 (2x at tp2, 4x at tp4) -> garbage. See upstream
+            # bailing_moe.py which also builds this dense with reduce_results=False.
+            reduce_results=False,
         )
         if hasattr(config, "rotary_dim"):
             self.rotary_dim = config.rotary_dim
@@ -729,7 +755,9 @@ class BailingMoEAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
             q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(
+            _pic_rope_positions(positions, q, forward_batch), q, k
+        )
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.dense(attn_output)
         return output
@@ -748,7 +776,13 @@ class BailingMoELinearDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
-        self.use_mla = getattr(config, "full_attention_type", "mla") == "mla"
+        # MLA only when the config actually carries MLA attrs. v0.5.14's newer
+        # Bailing models set full_attention_type="mla" AND have qk_nope_head_dim;
+        # Ring (linear-2.0) configs have neither and use standard BailingMoEAttention.
+        self.use_mla = (
+            getattr(config, "full_attention_type", "mla") == "mla"
+            and hasattr(config, "qk_nope_head_dim")
+        )
 
         if config.attention_type == 0:  # Linear layer
             self.attention = BailingMoELinearAttention(
@@ -888,6 +922,12 @@ class BailingMoELinearDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        from sglang.srt.pic.diag_layer_dump import (
+            dump as _pic_dump,
+            enabled as _pic_diag_on,
+        )
+        if _pic_diag_on():
+            _pic_dump(self.layer_id, "post_norm", hidden_states)
         # logger.warning(
         #     f"===={self.layer_id=}, 3 shape= {hidden_states.shape}, {residual.shape}"
         # )
@@ -905,6 +945,12 @@ class BailingMoELinearDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+        if _pic_diag_on():
+            _pic_dump(
+                self.layer_id,
+                "linear",
+                hidden_states if residual is None else hidden_states + residual,
+            )
         return hidden_states, residual
 
     @staticmethod
@@ -1602,6 +1648,18 @@ class BailingMoeV2_5ForCausalLM(BailingMoELinearForCausalLM):
     pass
 
 
+# ponytail: PIC ring checkpoints declare these architectures; keep V2_5 (v0.5.14) too.
+class BailingMoeLinearForCausalLM(BailingMoELinearForCausalLM):
+    pass
+
+
+class BailingMoeLinearV2ForCausalLM(BailingMoELinearForCausalLM):
+    pass
+
+
 EntryClass = [
+    BailingMoELinearForCausalLM,
     BailingMoeV2_5ForCausalLM,
+    BailingMoeLinearForCausalLM,
+    BailingMoeLinearV2ForCausalLM,
 ]

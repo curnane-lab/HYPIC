@@ -791,6 +791,9 @@ class Req(ReqDllmMixin):
         self.mamba_last_track_seqlen: Optional[int] = (
             None  # seq len of the last cached mamba state
         )
+        self.mamba_last_track_buffer_idx: Optional[int] = (
+            None  # ping-pong buffer idx holding mamba_last_track_seqlen
+        )
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
@@ -842,6 +845,20 @@ class Req(ReqDllmMixin):
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+
+        # PIC fields — populated only when tree_cache is PICache.
+        # See qianyou/2026-05-28-pic-sglang-design.md §5.3.
+        self.pic_segments: Optional[List[Tuple[int, int]]] = None
+        self.pic_hit_segments: List[Tuple[int, int, bytes]] = []
+        self.pic_miss_segments: List[Tuple[int, int]] = []
+        self.pic_segment_entries: Dict[bytes, "SegmentEntry"] = {}
+        self.pic_miss_token_positions: Optional[torch.Tensor] = None
+        # transition_rope_recompute: per-hit-segment seam absolute positions
+        # (real-pos in fill_ids). When set, hit-seg sink tokens are
+        # treated as miss tokens (re-forwarded; their K/V written into the
+        # private slots' seam positions in Phase C).
+        # Schema: {(start, end): sink_positions}
+        self.pic_hit_seam_positions: Dict[Tuple[int, int], List[int]] = {}
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -1200,6 +1217,51 @@ class Req(ReqDllmMixin):
             else:
                 self.cache_protected_len = len(self.prefix_indices)
 
+            if match_result.pic_segment_entries is not None:
+                assert (
+                    self.pic_segments is not None
+                ), "PICache returned pic_segment_entries but req has no pic_segments"
+                self.pic_segment_entries = {
+                    e.seg_hash: e
+                    for e in match_result.pic_segment_entries
+                    if e is not None
+                }
+                self.pic_hit_segments = [
+                    (start, end, e.seg_hash)
+                    for (start, end), e in zip(
+                        self.pic_segments, match_result.pic_segment_entries
+                    )
+                    if e is not None
+                ]
+                self.pic_miss_segments = [
+                    (start, end)
+                    for (start, end), e in zip(
+                        self.pic_segments, match_result.pic_segment_entries
+                    )
+                    if e is None
+                ]
+                positions: list = []
+                for (start, end) in self.pic_miss_segments:
+                    positions.extend(range(start, end))
+                # transition_rope_recompute: hit-seg seam tokens are also
+                # extend tokens (re-forwarded). Append them in real-pos order
+                # so positions align with input_ids order.
+                hit_seam = getattr(self, "pic_hit_seam_positions", None)
+                if hit_seam:
+                    seam_positions: list = []
+                    for (s, e), sink_pos in hit_seam.items():
+                        seam_positions.extend(sink_pos)
+                    # Merge miss + seam positions, sort by absolute pos to match
+                    # the order sglang uses when assembling input_ids from
+                    # fill_ids[len(prefix):] (which is real-pos sorted because
+                    # prefix_indices carves out cached subseqs in order).
+                    positions.extend(seam_positions)
+                    positions.sort()
+                if positions:
+                    self.pic_miss_token_positions = torch.tensor(
+                        positions, dtype=torch.int64
+                    )
+
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 
@@ -1461,6 +1523,7 @@ class Req(ReqDllmMixin):
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
+        self.mamba_last_track_buffer_idx = None
         self.mamba_branching_seqlen = None
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
@@ -2014,7 +2077,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
+        from sglang.srt.pic.picache import PICache
+
+        if isinstance(self.tree_cache, PICache):
+            input_ids = []
+            for r in self.reqs:
+                if r.pic_miss_token_positions is not None:
+                    pos = r.pic_miss_token_positions
+                    fill = r.get_fill_ids()
+                    input_ids.append(array("q", (fill[i] for i in pos.tolist())))
+                else:
+                    input_ids.append(r.get_fill_ids())
+        else:
+            input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [r.fill_len for r in reqs]
         orig_seq_lens = [max(r.fill_len, len(r.origin_input_ids)) for r in reqs]
@@ -2126,6 +2201,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion
                     req.cached_tokens_storage = storage_portion
+
+                    # PIC: hit segments are composed from device-cached state and
+                    # are not re-forwarded. match_prefix already folds their slots
+                    # into prefix_indices, so the radix accounting above (pre_len)
+                    # counts them — no separate PIC add here (would double-count).
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len
@@ -2816,6 +2896,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
+    @property
+    def pic_mode(self):
+        """PIC composition mode for this batch, or None when PIC is off."""
+        from sglang.srt.pic.picache import PICache
+
+        return (
+            self.tree_cache.pic_mode
+            if isinstance(self.tree_cache, PICache)
+            else None
+        )
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
         # Shallow-copy the reqs list so that in-place mutations (filter_batch,

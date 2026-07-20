@@ -258,6 +258,12 @@ pub enum PolicyConfig {
     #[serde(rename = "round_robin")]
     RoundRobin,
 
+    #[serde(rename = "pic_round_robin")]
+    PicRoundRobin,
+
+    #[serde(rename = "pic_lpt")]
+    PicLpt,
+
     #[serde(rename = "cache_aware")]
     CacheAware {
         cache_threshold: f32,
@@ -343,6 +349,8 @@ impl PolicyConfig {
         match self {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
+            PolicyConfig::PicRoundRobin => "pic_round_robin",
+            PolicyConfig::PicLpt => "pic_lpt",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::Bucket { .. } => "bucket",
@@ -1381,5 +1389,21 @@ mod tests {
             PolicyConfig::RoundRobin => {}
             _ => panic!("Expected RoundRobin for regular mode"),
         }
+    }
+}
+
+#[cfg(test)]
+mod pic_lpt_policy_tests {
+    use super::*;
+
+    #[test]
+    fn pic_lpt_name_roundtrips() {
+        assert_eq!(PolicyConfig::PicLpt.name(), "pic_lpt");
+    }
+
+    #[test]
+    fn pic_lpt_serde_rename() {
+        let v = serde_json::to_value(PolicyConfig::PicLpt).unwrap();
+        assert_eq!(v.get("type").unwrap(), "pic_lpt");
     }
 }

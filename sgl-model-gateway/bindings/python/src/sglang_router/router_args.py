@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 _POLICY_CHOICES = (
     "random",
     "round_robin",
+    "pic_round_robin",
+    "pic_lpt",
     "cache_aware",
     "power_of_two",
     "bucket",

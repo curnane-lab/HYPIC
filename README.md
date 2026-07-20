@@ -1,95 +1,120 @@
-<div align="center" id="sglangtop">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
+# HYPIC: Accelerating Hybrid-Attention LLM Serving with Position-Independent Caching
 
-[![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
-![PyPI - Downloads](https://static.pepy.tech/badge/sglang?period=month)
-[![license](https://img.shields.io/github/license/sgl-project/sglang.svg)](https://github.com/sgl-project/sglang/tree/main/LICENSE)
-[![issue resolution](https://img.shields.io/github/issues-closed-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![open issues](https://img.shields.io/github/issues-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sgl-project/sglang)
+[![arXiv](https://img.shields.io/badge/arXiv-2607.01299-b31b1b.svg)](https://arxiv.org/abs/2607.01299)
 
-</div>
+HYPIC is the first serving system to bring position-independent caching (PIC) to hybrid-attention LLMs. Existing PIC reuses per-token KV cache, but hybrid stacks are mostly linear-attention layers that expose only a per-request recurrent state — so prior PIC primitives don't transfer. HYPIC closes this gap.
 
---------------------------------------------------------------------------------
+Key techniques:
 
-<p align="center">
-<a href="https://lmsys.org/blog/"><b>Blog</b></a> |
-<a href="https://docs.sglang.io/"><b>Documentation</b></a> |
-<a href="https://roadmap.sglang.io/"><b>Roadmap</b></a> |
-<a href="https://slack.sglang.io/"><b>Join Slack</b></a> |
-<a href="https://meet.sglang.io/"><b>Weekly Dev Meeting</b></a> |
-<a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
-</p>
+- **Cached transition** — caches each segment's transition operator $T_C$ with its zero-start end-state, composing linear-attention states near-exactly in constant time.
+- **Seam window** — recomputes a small window at each segment beginning to repair cross-segment attention in the full-attention layers.
+- **Segment parallelism** — dispatches a request's cold segments across workers for parallel prefill, cutting long-cold-request tail TTFT.
 
-## News
-- [2026/06] 🔥 The next generation of speculative decoding: DFlash and Spec V2 ([blog](https://lmsys.org/blog/2026-06-15-next-generation-speculative-decoding-dflash-v2/)).
-- [2026/04] 🔥 DeepSeek-V4 on Day 0: From Fast Inference to Verified RL with SGLang and Miles ([blog](https://lmsys.org/blog/2026-04-25-deepseek-v4/)).
-- [2026/06] SGLang provides day-0 support for latest open models ([Nemotron 3 Ultra](https://lmsys.org/blog/2026-06-04-nvidia-run-nemotron-3-ultra/), [Nemotron 3 Super](https://lmsys.org/blog/2026-03-11-run-nvidia-nemotron-3-super/), [Higgs Audio v3 TTS](https://lmsys.org/blog/2026-06-04-higgs-audio-v3-tts/)).
-- [2026/02] 🔥 Unlocking 25x Inference Performance with SGLang on NVIDIA GB300 NVL72 ([blog](https://lmsys.org/blog/2026-02-20-gb300-inferencex/)).
-- [2026/01] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2026-01-16-sglang-diffusion/)).
-- [2025/12] SGLang provides day-0 support for latest open models ([MiMo-V2-Flash](https://lmsys.org/blog/2025-12-16-mimo-v2-flash/), [Nemotron 3 Nano](https://lmsys.org/blog/2025-12-15-run-nvidia-nemotron-3-nano/), [Mistral Large 3](https://github.com/sgl-project/sglang/pull/14213), [LLaDA 2.0 Diffusion LLM](https://lmsys.org/blog/2025-12-19-diffusion-llm/), [MiniMax M2](https://lmsys.org/blog/2025-11-04-miminmax-m2/)).
-- [2025/10] SGLang now runs natively on TPU with the SGLang-Jax backend ([blog](https://lmsys.org/blog/2025-10-29-sglang-jax/)).
+Across four hybrid-attention models and five workloads, HYPIC cuts TTFT by **3.25×** and lifts QPS by **1.66×** over Prefix Cache, within **1.71** points of Full Recompute. Built on [SGLang](https://github.com/sgl-project/sglang) v0.5.14. See the [paper](https://arxiv.org/abs/2607.01299) for details.
 
-<details>
-<summary>More</summary>
+## Install
 
-- [2025/09] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part II): 3.8x Prefill, 4.8x Decode Throughput ([blog](https://lmsys.org/blog/2025-09-25-gb200-part-2/)).
-- [2025/09] SGLang Day 0 Support for DeepSeek-V3.2 with Sparse Attention ([blog](https://lmsys.org/blog/2025-09-29-deepseek-V32/)).
-- [2025/08] SGLang x AMD SF Meetup on 8/22: Hands-on GPU workshop, tech talks by AMD/xAI/SGLang, and networking ([Roadmap](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_roadmap.pdf), [Large-scale EP](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_ep.pdf), [Highlights](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_highlights.pdf), [AITER/MoRI](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_aiter_mori.pdf), [Wave](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_wave.pdf)).
+```bash
+git clone https://github.com/redai-infra/HYPIC.git && cd HYPIC
+pip install -e "python[all]"
+```
 
-- [2025/11] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2025-11-07-sglang-diffusion/)).
-- [2025/10] PyTorch Conference 2025 SGLang Talk ([slide](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/sglang_pytorch_2025.pdf)).
-- [2025/10] SGLang x Nvidia SF Meetup on 10/2 ([recap](https://x.com/lmsysorg/status/1975339501934510231)).
-- [2025/08] SGLang provides day-0 support for OpenAI gpt-oss model ([instructions](https://github.com/sgl-project/sglang/issues/8833))
-- [2025/06] SGLang, the high-performance serving infrastructure powering trillions of tokens daily, has been awarded the third batch of the Open Source AI Grant by a16z ([a16z blog](https://a16z.com/advancing-open-source-ai-through-benchmarks-and-bold-experimentation/)).
-- [2025/05] Deploying DeepSeek with PD Disaggregation and Large-scale Expert Parallelism on 96 H100 GPUs ([blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/)).
-- [2025/06] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part I): 2.7x Higher Decoding Throughput ([blog](https://lmsys.org/blog/2025-06-16-gb200-part-1/)).
-- [2025/03] Supercharge DeepSeek-R1 Inference on AMD Instinct MI300X ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1-Part2/README.html))
-- [2025/03] SGLang Joins PyTorch Ecosystem: Efficient LLM Serving Engine ([PyTorch blog](https://pytorch.org/blog/sglang-joins-pytorch/))
-- [2025/02] Unlock DeepSeek-R1 Inference Performance on AMD Instinct™ MI300X GPU ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1_Perf/README.html))
-- [2025/01] SGLang provides day one support for DeepSeek V3/R1 models on NVIDIA and AMD GPUs with DeepSeek-specific optimizations. ([instructions](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3), [AMD blog](https://www.amd.com/en/developer/resources/technical-articles/amd-instinct-gpus-power-deepseek-v3-revolutionizing-ai-development-with-sglang.html), [10+ other companies](https://x.com/lmsysorg/status/1887262321636221412))
-- [2024/12] v0.4 Release: Zero-Overhead Batch Scheduler, Cache-Aware Load Balancer, Faster Structured Outputs ([blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)).
-- [2024/10] The First SGLang Online Meetup ([slides](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#the-first-sglang-online-meetup)).
-- [2024/09] v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
-- [2024/07] v0.2 Release: Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
-- [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
-- [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
-- [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
+## Quickstart
 
-</details>
+Enable PIC on any launch by adding the PIC flags. Prompts are split into
+reusable segments at a separator string (`<<PIC_SEP>>`):
 
-## About
-SGLang is a high-performance serving framework for large language models and multimodal models.
-It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
-Its core features include:
+```bash
+python -m sglang.launch_server \
+  --model-path /path/to/Qwen3.5-35B-A3B --tp 2 \
+  --page-size 1 --chunked-prefill-size -1 --disable-piecewise-cuda-graph \
+  --pic-enable \
+  --pic-mode transition_rope_recompute \
+  --pic-separator-str '<<PIC_SEP>>' \
+  --enable-cache-report
+```
 
-- **Fast Runtime**: Provides efficient serving with RadixAttention for prefix caching, a zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor/pipeline/expert/data parallelism, structured outputs, chunked prefill, quantization (FP4/FP8/INT4/AWQ/GPTQ), and multi-LoRA batching.
-- **Broad Model Support**: Supports a wide range of language models (Llama, Qwen, DeepSeek, Kimi, GLM, GPT, Gemma, Mistral, etc.), embedding models (e5-mistral, gte, mcdse), reward models (Skywork), and diffusion models (WAN, Qwen-Image), with easy extensibility for adding new models. Compatible with most Hugging Face models and OpenAI APIs.
-- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark/5090), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
-- **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
-- **RL & Post-Training Backbone**: SGLang is a proven rollout backend used for training many frontier models, with native RL integrations and adoption by well-known post-training frameworks such as [**AReaL**](https://github.com/inclusionAI/AReaL), [**Miles**](https://github.com/radixark/miles), [**slime**](https://github.com/THUDM/slime), [**Tunix**](https://github.com/google/tunix), [**verl**](https://github.com/volcengine/verl) and more.
+```bash
+curl localhost:30000/generate -H 'Content-Type: application/json' -d '{
+  "text": "The Eiffel Tower is in Paris, France.",
+  "sampling_params": {"temperature": 0, "max_new_tokens": 1}
+}'
+curl localhost:30000/generate -H 'Content-Type: application/json' -d '{
+  "text": "Mount Fuji is the tallest mountain in Japan.",
+  "sampling_params": {"temperature": 0, "max_new_tokens": 1}
+}'
+curl localhost:30000/generate -H 'Content-Type: application/json' -d '{
+  "text": "You are a helpful assistant.<<PIC_SEP>>The Eiffel Tower is in Paris, France.<<PIC_SEP>>Mount Fuji is the tallest mountain in Japan.<<PIC_SEP>>Question: In which country is the Eiffel Tower?",
+  "sampling_params": {"temperature": 0, "max_new_tokens": 512}
+}'
+```
 
-## Getting Started
-- [Install SGLang](https://docs.sglang.io/get_started/install.html)
-- [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
-- [Backend Tutorial](https://docs.sglang.io/basic_usage/openai_api_completions.html)
-- [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
-- [Contribution Guide](https://docs.sglang.io/developer_guide/contribution_guide.html)
+Each `<<PIC_SEP>>`-delimited chunk is cached position-independently and reused across requests regardless of order. 
+With `--enable-cache-report`, the final request's `meta_info` reports a cache hit (e.g. `"cached_tokens": 17`) for the two document chunks — even though neither is a shared prefix, where plain prefix caching would report zero.
 
-## Benchmark and Performance
-Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/), [GB300 long context](https://lmsys.org/blog/2026-02-19-gb300-longctx/).
+### Self-contained examples (`examples/pic/`)
 
-## Adoption and Sponsorship
-SGLang has been deployed at large scale, generating trillions of tokens in production each day. It is trusted and adopted by a wide range of leading enterprises and institutions, including xAI, AMD, NVIDIA, Intel, LinkedIn, Cursor, Oracle Cloud, Google Cloud, Microsoft Azure, AWS, Atlas Cloud, Voltage Park, Nebius, DataCrunch, Novita, InnoMatrix, Modal, MIT, UCLA, the University of Washington, Stanford, UC Berkeley, Tsinghua University, Jam & Tea Studios, Baseten, and other major technology organizations.
-As an open-source LLM inference engine, SGLang has become the de facto industry standard, with deployments running on over 400,000 GPUs worldwide.
-SGLang is currently hosted under the non-profit open-source organization [LMSYS](https://lmsys.org/about/).
+| Script | What it does |
+|---|---|
+| `quick_test_offline.py` | 6-way in-process (`sgl.Engine`) comparison — full_recompute / prefix_cache / pic_addition / pic_transition / pic_transition_rope / pic_transition_rope_recompute — on one model. |
+| `quick_test_online.py` | Same 6-way comparison over an HTTP server: launches `sglang.launch_server` per mode, runs warmup + TTFT + first-decoded-token check. |
+| `diag_layer_divergence.py` | Per-layer bisect: finds the first decoder layer where PIC's residual diverges from the baseline (accuracy debugging). |
+| `distribute/` | Segment parallelism — 4-prefill + 1-decode PIC scatter cluster, with an LPT-vs-RR speedup/correctness harness. See `examples/pic/distribute/README.md`. |
 
-<img src="https://raw.githubusercontent.com/sgl-project/sgl-learning-materials/refs/heads/main/slides/adoption.png" alt="logo" width="800" margin="10px"></img>
+```bash
+# offline / online 6-way sweep on one model
+python examples/pic/quick_test_offline.py --model ring_mini
+python examples/pic/quick_test_online.py  --model qwen35b
 
-## Contact Us
-For enterprises interested in adopting or deploying SGLang at scale, including technical consulting, sponsorship opportunities, or partnership inquiries, please contact us at [sglang@lmsys.org](mailto:sglang@lmsys.org).
+# per-layer divergence bisect (PIC vs baseline)
+PIC_DIAG_MODE=transition_rope python examples/pic/diag_layer_divergence.py
 
-Long-term active SGLang contributors are eligible for coding agent sponsorship, such as Cursor, Claude Code, or OpenAI Codex. Email [sglang@lmsys.org](mailto:sglang@lmsys.org) with your most important commits or pull requests.
+# distributed segment parallelism (scatter) — see distribute/README.md
+cd examples/pic/distribute
+export DISTPIC_UCX_ENV="UCX_NET_DEVICES=mlx5_1:1,... UCX_IB_GID_INDEX=7"  # required on RDMA/IB hosts (see distribute/README.md)
+bash cluster.sh up          # 4 prefill + 1 decode + single-GPU PIC baseline (boots in background)
+bash cluster.sh router lpt  # start the LPT scatter router
+bash cluster.sh check       # wait until /health is green on every endpoint
+bash cluster.sh accept lpt  # baseline vs scatter: OUTPUT identical + median speedup
+bash cluster.sh down        # tear everything down
+```
 
-## Acknowledgment
-We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+`--model` takes `qwen35b`, `qwen122b`, `ring_mini`, `ring_flash`; override the
+model path / TP with `PIC_MODEL` / `PIC_TP`.
+
+## PIC modes
+
+`--pic-mode` selects how cached segment state is composed:
+
+| Mode | Compose                | RoPE adjustment | Seam recompute | Use                                                           |
+|---|------------------------|-----------------|---|---------------------------------------------------------------|
+| `addition` | segment state add      | no               | no | naive linear-attention PIC baseline.                          |
+| `transition` | cached transition operator | no              | no | Core HYPIC state compose.                                     |
+| `transition_rope` | cached transition operator | yes             | no | + correct absolute-position RoPE for non-contiguous hits.     |
+| `transition_rope_recompute` | cached transition operator | yes             | yes | **+ seam window** repairs full-attn cross-segment attention.  |
+
+The seam width is a runtime knob independent of mode: `PIC_SEAM_SINK`
+(default `8`). `0` = reuse the whole hit segment; `0 < x ≤ 1` = fraction of
+each hit segment to recompute; `x > 1` = absolute token count.
+
+## Supported models
+
+Four hybrid linear+full-attention models are wired into the examples:
+
+| `--model` | Path (default) | TP |
+|---|---|---|
+| `qwen35b` | `Qwen3.5-35B-A3B` | 2 |
+| `qwen122b` | `Qwen3.5-122B-A10B` | 4 |
+| `ring_mini` | `Ring-mini-linear-2.0` | 1 |
+| `ring_flash` | `Ring-flash-linear-2.0` | 4 |
+
+## Citation
+
+```bibtex
+@article{liu2026hypic,
+  title={HYPIC: Accelerating Hybrid-Attention LLM Serving with Position-Independent Caching},
+  author={Liu, Yifei and Wu, Juntong and Liu, Yang and Hu, Junhao and Li, Minghao and Chen, Xiaoxu and Chen, Weihang},
+  journal={arXiv preprint arXiv:2607.01299},
+  year={2026}
+}
+```

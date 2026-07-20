@@ -25,7 +25,17 @@ from array import array
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Literal, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 from pydantic import PlainValidator
@@ -283,6 +293,17 @@ class GenerateReqInput(BaseReq):
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
+    # PIC: populated by TokenizerManager when ServerArgs.pic_enable is True.
+    # List of (start, end) offsets into input_ids, segment boundaries derived
+    # from PIC_SEPARATOR_STR splits. None when PIC is disabled.
+    pic_segments: Optional[List[Tuple[int, int]]] = None
+
+    # PIC distributed-scatter: scatter/combine request routing fields.
+    # pic_scatter_meta carries combine_addr/scatter_room/seg_index;
+    # pic_combine is a list of {seg_index, worker_addr, room} for combine reqs.
+    pic_scatter_single_seg: bool = False
+    pic_scatter_meta: Optional[dict] = None
+    pic_combine: Optional[list] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -845,6 +866,16 @@ class TokenizedGenerateReqInput(BaseReq):
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
+    # PIC: per-request segment ranges produced by split_and_tokenize.
+    # See qianyou/2026-05-28-pic-sglang-design.md §5.3.
+    pic_segments: Optional[List[Tuple[int, int]]] = None
+
+    # PIC distributed-scatter: scatter/combine routing fields (see io_struct
+    # GenerateReqInput for semantics).
+    pic_scatter_single_seg: bool = False
+    pic_scatter_meta: Optional[dict] = None
+    pic_combine: Optional[list] = None
+
 
 @dataclass
 class BatchTokenizedGenerateReqInput(BaseBatchReq):
@@ -1299,6 +1330,28 @@ class ClearHiCacheReqInput(BaseReq):
 @dataclass
 class ClearHiCacheReqOutput(BaseReq):
     success: bool
+
+
+@dataclass
+class PicScatterHandleReq(BaseReq):
+    room: int
+    seg_index: int
+    dst_kv_ptrs: List[int]
+    dst_kv_item_len: List[int]
+    dst_state_data_ptrs: List[int]
+    dst_state_item_lens: List[int]
+    dst_state_dim_per_tensor: Optional[List[int]]
+    dst_kv_indices: List[int]
+    dst_state_indices: List[int]
+    agent_meta_b64: str
+    notif_kv: str
+    notif_mamba: str
+
+
+@dataclass
+class PicScatterHandleOutput(BaseReq):
+    ok: bool
+    error: str = ""
 
 
 @dataclass

@@ -18,6 +18,10 @@ impl PolicyFactory {
         match config {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
+            // ponytail: combine/decode selection reuses plain round-robin; scatter pre-step is gated in PDRouter, not the policy.
+            PolicyConfig::PicRoundRobin => Arc::new(RoundRobinPolicy::new()),
+            // ponytail: LPT 也复用 round-robin 做 PD 对选择;段级均衡在 PDRouter 的 scatter 里。
+            PolicyConfig::PicLpt => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::CacheAware {
                 cache_threshold,
@@ -78,6 +82,8 @@ impl PolicyFactory {
         match name.to_lowercase().as_str() {
             "random" => Some(Arc::new(RandomPolicy::new())),
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
+            "pic_round_robin" => Some(Arc::new(RoundRobinPolicy::new())),
+            "pic_lpt" => Some(Arc::new(RoundRobinPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "bucket" => Some(Arc::new(BucketPolicy::new())),
